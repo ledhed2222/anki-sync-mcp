@@ -11,7 +11,7 @@ license = "MIT"
 requires-python = ">=3.12,<3.13"
 dependencies = [
   "anki==26.5",
-  "mcp==1.28.1",
+  "mcp==1.30.0",
   "pydantic-settings>=2.7,<3",
   "starlette>=0.46,<1",
   "uvicorn[standard]>=0.34,<1",
