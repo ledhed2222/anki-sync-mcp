@@ -78,6 +78,14 @@ class Settings(BaseSettings):
     host: str = Field("0.0.0.0", alias="MCP_HOST")
     port: int = Field(8000, ge=1, le=65535, alias="MCP_PORT")
     mcp_path: str = Field("/mcp", alias="MCP_PATH")
+    auth_mode: Literal["bearer", "builtin"] = Field("bearer", alias="MCP_AUTH_MODE")
+    public_url: str = Field("", alias="MCP_PUBLIC_URL")
+    oauth_password_hash_input: SecretStr | None = Field(None, alias="MCP_OAUTH_PASSWORD_HASH")
+    oauth_password_hash_file: Path | None = Field(None, alias="MCP_OAUTH_PASSWORD_HASH_FILE")
+    oauth_redirect_uris_csv: str = Field(
+        "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback",
+        alias="MCP_OAUTH_REDIRECT_URIS",
+    )
     auth_token_input: SecretStr | None = Field(None, alias="MCP_AUTH_TOKEN")
     auth_token_file: Path | None = Field(None, alias="MCP_AUTH_TOKEN_FILE")
     collection_path: Path = Field(Path("/data/collection.anki2"), alias="ANKI_COLLECTION_PATH")
@@ -121,6 +129,7 @@ class Settings(BaseSettings):
     )
     auth_token: SecretStr = Field(default=SecretStr(""), exclude=True)
     sync_password: SecretStr | None = Field(default=None, exclude=True)
+    oauth_password_hash: SecretStr | None = Field(default=None, exclude=True)
 
     @property
     def sync_endpoint(self) -> str | None:
@@ -145,6 +154,27 @@ class Settings(BaseSettings):
         if value == "/health" or value.startswith("/health/"):
             raise ValueError("MCP_PATH must not overlap the reserved /health routes")
         return value
+
+    @property
+    def oauth_redirect_uris(self) -> frozenset[str]:
+        return frozenset(
+            item.strip() for item in self.oauth_redirect_uris_csv.split(",") if item.strip()
+        )
+
+    @model_validator(mode="after")
+    def validate_builtin_auth(self) -> Self:
+        if self.auth_mode != "builtin":
+            return self
+        parsed = urlsplit(self.public_url)
+        loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if not parsed.netloc or not (parsed.scheme == "https" or loopback):
+            raise ValueError("MCP_AUTH_MODE=builtin requires an HTTPS MCP_PUBLIC_URL")
+        if parsed.query or parsed.fragment or parsed.path.strip("/"):
+            raise ValueError("MCP_PUBLIC_URL must be an origin without path, query or fragment")
+        self.public_url = f"{parsed.scheme}://{parsed.netloc}"
+        if not self.oauth_redirect_uris:
+            raise ValueError("MCP_OAUTH_REDIRECT_URIS must list at least one redirect URI")
+        return self
 
     @property
     def allowed_hosts(self) -> list[str]:
@@ -208,12 +238,22 @@ class Settings(BaseSettings):
                 raise ValueError(f"{description} must not be empty")
             return SecretStr(raw)
 
+        builtin = values.get("MCP_AUTH_MODE", values.get("auth_mode", "bearer")) == "builtin"
         values["auth_token"] = resolve(
             "MCP_AUTH_TOKEN",
             "auth_token_input",
             "MCP_AUTH_TOKEN_FILE",
             "auth_token_file",
             "MCP authentication token",
+            required=not builtin,
+        ) or SecretStr("")
+        values["oauth_password_hash"] = resolve(
+            "MCP_OAUTH_PASSWORD_HASH",
+            "oauth_password_hash_input",
+            "MCP_OAUTH_PASSWORD_HASH_FILE",
+            "oauth_password_hash_file",
+            "OAuth password hash",
+            required=builtin,
         )
         values["sync_password"] = resolve(
             "ANKI_SYNC_PASSWORD",

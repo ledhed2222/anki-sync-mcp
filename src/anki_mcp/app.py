@@ -8,10 +8,12 @@ from typing import Annotated, Any, Generic, Literal, NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from anki.errors import NetworkError, SyncError, SyncErrorKind
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import (
+    AnyHttpUrl,
     BaseModel,
     ConfigDict,
     Field,
@@ -41,9 +43,11 @@ from anki_mcp.collection import (
 )
 from anki_mcp.config import Settings
 from anki_mcp.guard import ConfirmationRegistry
+from anki_mcp.oauth import BuiltinOAuthProvider
 
 T = TypeVar("T")
 LOGGER = logging.getLogger(__name__)
+_OAUTH_MAX_REQUEST_BYTES = 16_384
 Offset = StrictInt
 PageLimit = StrictInt
 StableId = Annotated[StrictInt, Field(gt=0)]
@@ -110,9 +114,7 @@ DeckPresetSection = Literal[
 DeckPresetSections = Annotated[tuple[DeckPresetSection, ...], Field(max_length=8)]
 DailyDeckLimitField = Literal["new_cards_per_day", "reviews_per_day"]
 DailyDeckLimitFields = Annotated[tuple[DailyDeckLimitField, ...], Field(max_length=2)]
-ThisDeckLimitField = Literal[
-    "new_cards_per_day", "reviews_per_day", "desired_retention"
-]
+ThisDeckLimitField = Literal["new_cards_per_day", "reviews_per_day", "desired_retention"]
 ThisDeckLimitFields = Annotated[tuple[ThisDeckLimitField, ...], Field(max_length=3)]
 NonNegativeFloat = Annotated[StrictFloat, Field(ge=0)]
 PositiveFloat = Annotated[StrictFloat, Field(gt=0)]
@@ -461,6 +463,20 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.sync_on_read,
         settings.sync_on_write,
     )
+    oauth_provider: BuiltinOAuthProvider | None = None
+    auth_settings: AuthSettings | None = None
+    if settings.auth_mode == "builtin":
+        oauth_provider = BuiltinOAuthProvider(settings)
+        auth_settings = AuthSettings(
+            issuer_url=AnyHttpUrl(settings.public_url),
+            resource_server_url=AnyHttpUrl(settings.public_url + settings.mcp_path),
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True,
+                valid_scopes=oauth_provider.scopes,
+                default_scopes=oauth_provider.scopes,
+            ),
+            revocation_options=RevocationOptions(enabled=True),
+        )
     mcp = FastMCP(
         "anki-mcp",
         instructions="Authenticated sync and deck/card CRUD for one Anki collection.",
@@ -471,6 +487,8 @@ def create_app(settings: Settings) -> ASGIApp:
             allowed_hosts=settings.allowed_hosts,
             allowed_origins=settings.allowed_origins,
         ),
+        auth_server_provider=oauth_provider,
+        auth=auth_settings,
     )
     registered_tool_names: list[str] = []
     confirmations = ConfirmationRegistry(settings.confirmation_ttl_seconds)
@@ -2006,12 +2024,20 @@ def create_app(settings: Settings) -> ASGIApp:
         Route("/health/live", live, methods=["GET"]),
         Route("/health/ready", ready, methods=["GET"]),
         *mcp_app.routes,
+        *(oauth_provider.routes() if oauth_provider is not None else []),
     ]
-    app = Starlette(routes=routes, lifespan=lifespan)
+    app = Starlette(routes=routes, middleware=mcp_app.user_middleware, lifespan=lifespan)
     app.state.settings = settings
     app.state.collection_service = service
+    limited: ASGIApp = RequestBodyLimitMiddleware(
+        app, settings.max_request_bytes, settings.mcp_path
+    )
+    if oauth_provider is not None:
+        for path in ("/oauth", "/register", "/token", "/revoke"):
+            limited = RequestBodyLimitMiddleware(limited, _OAUTH_MAX_REQUEST_BYTES, path)
+        return limited
     return BearerAuthMiddleware(
-        RequestBodyLimitMiddleware(app, settings.max_request_bytes, settings.mcp_path),
+        limited,
         settings.auth_token.get_secret_value(),
         settings.mcp_path,
     )
