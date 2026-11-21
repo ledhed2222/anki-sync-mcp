@@ -75,6 +75,7 @@ Compose file, add it under `services.anki-mcp.environment`.
 | `MCP_HOST` | `0.0.0.0` | Address on which the HTTP server listens. |
 | `MCP_PORT` | `8000` | HTTP listen port (`1`-`65535`). Keep this consistent with `expose`, any `ports` mapping, and the client URL. |
 | `MCP_PATH` | `/mcp` | MCP endpoint path. It must be an absolute, static, non-root path and must not overlap `/health`. |
+| `MCP_AUTH_MODE` | `bearer` | `bearer` checks the static token below. `builtin` runs a single-owner OAuth authorization server instead (see [Built-in OAuth](#built-in-oauth)); the bearer token is then not used. |
 | `MCP_AUTH_TOKEN` | required alternative | Bearer token supplied directly. Use exactly one of this setting and `MCP_AUTH_TOKEN_FILE`; the Compose setup uses the file variant. |
 | `MCP_AUTH_TOKEN_FILE` | required alternative | Path to a file containing the bearer token. One trailing newline is ignored. Compose mounts `./secrets/anki_mcp_token` at `/run/secrets/anki_mcp_token`. |
 | `MCP_SCOPES` | `read,write,admin` | Comma-separated tool groups to register. Allowed values are `read`, `write`, `admin`, and `destructive`. Destructive tools require both the `destructive` scope and their feature flag. |
@@ -84,6 +85,32 @@ Compose file, add it under `services.anki-mcp.environment`.
 
 The `/health/live` and `/health/ready` endpoints are not bearer-authenticated. The supplied
 Compose network keeps them private unless you publish the container port.
+
+### Built-in OAuth
+
+Clients that expect an OAuth flow, such as claude.ai custom connectors, can connect when
+`MCP_AUTH_MODE=builtin`. The server then acts as its own authorization server for one owner.
+It supports dynamic client registration, authorization code with PKCE, rotating refresh tokens
+and revocation. Signing in means entering the owner password on the server's `/oauth/login`
+page. Tokens are stored only as SHA-256 hashes, in `state/oauth.json` next to the collection.
+
+1. Create a password hash: `docker compose run --rm anki-mcp anki-mcp-hash-password`, or
+   `uv run anki-mcp-hash-password` locally.
+2. Set `MCP_AUTH_MODE=builtin`, `MCP_PUBLIC_URL`, and the hash.
+3. Add the public hostname to `MCP_ALLOWED_HOSTS`.
+4. Expose the server over HTTPS. The reverse proxy must forward `/mcp`, `/oauth/login`,
+   `/authorize`, `/token`, `/register`, `/revoke` and `/.well-known/`.
+5. In the client, add `https://<host>/mcp` as the connector URL.
+
+Each issued token carries every scope in `MCP_SCOPES`. Use `MCP_SCOPES` to limit what an
+internet-facing server exposes.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCP_PUBLIC_URL` | required in `builtin` mode | Public HTTPS origin of the server, such as `https://anki.example.com`. It is used as the OAuth issuer. HTTP is accepted only for loopback hosts. |
+| `MCP_OAUTH_PASSWORD_HASH` | required alternative in `builtin` mode | Owner password hash from `anki-mcp-hash-password`. Use exactly one of this setting and `MCP_OAUTH_PASSWORD_HASH_FILE`. |
+| `MCP_OAUTH_PASSWORD_HASH_FILE` | required alternative in `builtin` mode | Path to a file containing the password hash. |
+| `MCP_OAUTH_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback` | Comma-separated redirect URIs that clients may register. A client asking for any other redirect URI is refused, so a stranger cannot register a client that sends your authorization code to their own site. |
 
 ### Collection and synchronization
 

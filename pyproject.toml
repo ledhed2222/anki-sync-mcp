@@ -20,6 +20,7 @@ dependencies = [
 [project.scripts]
 anki-mcp = "anki_mcp.__main__:main"
 anki-mcp-healthcheck = "anki_mcp.healthcheck:main"
+anki-mcp-hash-password = "anki_mcp.oauth:main"
 
 [dependency-groups]
 dev = [
