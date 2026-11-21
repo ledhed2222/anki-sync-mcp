@@ -529,9 +529,9 @@ async def test_fsrs_reschedule_fingerprint_ignores_history_before_configured_dat
 
     async with AnkiCollectionService(path, max_page_size=100) as service:
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
-        await service.update_deck_preset(
-            1, None, {"ignore_revlogs_before_date": "2026-06-01"}
-        )
+        # Between the fixture's first (-100 days) and second (-90 days) review.
+        cutoff = time.strftime("%Y-%m-%d", time.localtime(time.time() - 95 * 86_400))
+        await service.update_deck_preset(1, None, {"ignore_revlogs_before_date": cutoff})
         before = await service.preview_fsrs_reschedule(1, 0.91, None)
 
         def change_ignored_review(adapter):  # type: ignore[no-untyped-def]
