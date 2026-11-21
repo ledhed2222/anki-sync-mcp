@@ -1,3 +1,10 @@
+"""Built-in OAuth authorization server for MCP_AUTH_MODE=builtin.
+
+Lets OAuth-only clients, such as claude.ai custom connectors, connect to a single-owner server.
+The owner signs in with a password, and the MCP SDK provides the OAuth endpoints. Also provides
+the anki-mcp-hash-password command.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -36,7 +43,6 @@ _REFRESH_TOKEN_SECONDS = 30 * 24 * 3600
 _AUTHORIZATION_CODE_SECONDS = 300
 _LOGIN_REQUEST_SECONDS = 600
 _FAILED_LOGIN_DELAY_SECONDS = 1.0
-# ponytail: hard cap on dynamically registered clients; add eviction if real clients hit it
 _MAX_CLIENTS = 50
 _MAX_PENDING_LOGINS = 100
 _SCRYPT_N, _SCRYPT_R, _SCRYPT_P = 2**15, 8, 1
