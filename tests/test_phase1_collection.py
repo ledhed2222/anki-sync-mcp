@@ -504,23 +504,23 @@ async def test_controlled_bootstrap_downloads_only_into_an_empty_collection(
 
 
 @pytest.mark.anyio
-async def test_controlled_bootstrap_refuses_a_nonempty_local_collection(
+async def test_controlled_bootstrap_skips_a_nonempty_local_collection(
     collection_path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    login_called = False
-
-    def login(_: Collection, username: str, password: str, endpoint: str | None) -> SyncAuth:
-        nonlocal login_called
-        login_called = True
-        return SyncAuth(hkey="unexpected", endpoint=endpoint)
-
-    monkeypatch.setattr(Collection, "sync_login", login)
+    touched: list[str] = []
+    monkeypatch.setattr(Collection, "sync_login", lambda *args, **kwargs: touched.append("login"))
+    monkeypatch.setattr(
+        Collection, "sync_collection", lambda *args, **kwargs: touched.append("sync")
+    )
+    monkeypatch.setattr(
+        Collection, "full_upload_or_download", lambda *args, **kwargs: touched.append("full")
+    )
     async with AnkiCollectionService(collection_path, max_page_size=100) as service:
-        with pytest.raises(ValueError, match="empty local collection"):
-            await service.bootstrap(
-                "download_if_empty", "bootstrap-user", "bootstrap-password", None
-            )
-    assert login_called is False
+        result = await service.bootstrap(
+            "download_if_empty", "bootstrap-user", "bootstrap-password", None
+        )
+    assert result == {"bootstrapped": False, "reason": "not_empty"}
+    assert touched == []
 
 
 @pytest.mark.anyio

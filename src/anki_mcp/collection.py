@@ -374,7 +374,7 @@ class CollectionAdapter:
         if mode != "download_if_empty":
             raise ValueError("unsupported bootstrap mode")
         if self.collection.note_count() or self.collection.card_count():
-            raise ValueError("download_if_empty bootstrap requires an empty local collection")
+            return {"bootstrapped": False, "reason": "not_empty"}
         if self._sync_auth is None:
             if not username.strip() or password is None:
                 raise SyncLoginRequiredError(
