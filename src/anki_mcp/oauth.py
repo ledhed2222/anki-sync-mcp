@@ -13,6 +13,7 @@ import getpass
 import hashlib
 import hmac
 import html
+import logging
 import secrets
 import sys
 import time
@@ -38,6 +39,7 @@ from starlette.routing import Route
 from anki_mcp.config import Settings
 from anki_mcp.state import PersistentState
 
+_LOGGER = logging.getLogger(__name__)
 _ACCESS_TOKEN_SECONDS = 3600
 _REFRESH_TOKEN_SECONDS = 30 * 24 * 3600
 _AUTHORIZATION_CODE_SECONDS = 300
@@ -126,6 +128,10 @@ class BuiltinOAuthProvider:
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         requested = {str(uri) for uri in client_info.redirect_uris or []}
         if not requested or not requested <= self._redirect_uris:
+            _LOGGER.debug(
+                "refused client registration: redirect_uris %r not in MCP_OAUTH_REDIRECT_URIS",
+                sorted(uri[:200] for uri in requested - self._redirect_uris),
+            )
             raise RegistrationError(
                 "invalid_redirect_uri", "redirect_uris must be listed in MCP_OAUTH_REDIRECT_URIS"
             )
