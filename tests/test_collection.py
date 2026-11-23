@@ -539,6 +539,7 @@ async def test_sync_login_uses_configured_credentials_and_sync_reuses_host_key(
             "removed": "",
         },
         "endpoint_changed": False,
+        "full_download": None,
     }
 
 

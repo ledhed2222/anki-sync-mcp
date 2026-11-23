@@ -135,10 +135,11 @@ receipts, and backups. Preserve the volume across container recreation.
 | Variable | Default | Description |
 | --- | --- | --- |
 | `ANKI_ALLOW_DESTRUCTIVE` | `false` | Registers delete and FSRS rescheduling preview/apply tools when `MCP_SCOPES` also includes `destructive`. Applying destructive changes requires a preview token and verified fresh backup. |
-| `ANKI_ALLOW_FULL_SYNC` | `false` | Registers explicit full-download and full-upload recovery tools. It must also be enabled for schema-changing tools. |
-| `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Registers note-type and template mutation tools when `ANKI_ALLOW_FULL_SYNC` is also enabled. Note-type deletion additionally requires destructive access. |
+| `ANKI_ALLOW_FULL_SYNC` | `false` | Registers explicit full-download and full-upload recovery tools. It must also be enabled for `anki_note_type_fields_update` and `anki_templates_update`, which can force a full sync. |
+| `ANKI_ALLOW_SCHEMA_CHANGES` | `false` | Registers `anki_note_types_create` and `anki_note_types_update`, which never force a full sync. The field and template mapping tools also need `ANKI_ALLOW_FULL_SYNC`. |
 | `ANKI_ALLOW_REVIEW_ANSWERS` | `false` | Registers the administrative card-answering tool, which changes scheduling state. |
 | `ANKI_CONFIRMATION_TTL_SECONDS` | `300` | Lifetime of destructive-operation preview tokens (`30`-`3600` seconds). Tokens are single-use. |
+| `ANKI_CONFIRMATION_MODE` | `token` | How destructive tools get approval. `token`: the preview token alone. `elicit`: also asks the person through MCP elicitation when the client supports it, otherwise falls back to `token`. `elicit_required`: refuses destructive calls from clients that cannot elicit. A prompt left unanswered for `ANKI_CONFIRMATION_TTL_SECONDS` counts as a decline. Full-sync tools ignore this setting and always ask (see below). Both elicit modes, and `ANKI_ALLOW_FULL_SYNC=true`, switch the MCP endpoint to SSE responses. |
 | `ANKI_MAX_BATCH_SIZE` | `50` | Maximum notes accepted by one atomic batch-create operation (`1`-`500`). |
 | `MCP_MAX_PAGE_SIZE` | `100` | Maximum `limit` accepted by paginated tools (`1`-`1000`). |
 | `MCP_MAX_SEARCH_SCAN` | `10000` | Maximum collection items that bounded list/search and tag operations may scan (`1`-`1000000`). |
@@ -151,6 +152,23 @@ receipts, and backups. Preserve the volume across container recreation.
 Boolean values accept the forms supported by Pydantic settings, including `true`/`false`,
 `1`/`0`, and `yes`/`no`. Invalid or unknown configuration causes startup to fail instead of
 silently falling back to a default.
+
+### Human confirmation
+
+Every tool declares how it affects the collection, through its annotations and the `anki-mcp/sync` key in its `_meta`:
+
+| Kind | `anki-mcp/sync` | Annotations | Approval |
+| --- | --- | --- | --- |
+| Read and preview | `none` | `readOnlyHint`, `idempotentHint` | None |
+| Write that syncs incrementally, such as adding notes or repositioning cards | `incremental` | `destructiveHint` on deletes, deck option and scheduler changes, and FSRS apply | Preview token, plus a prompt when `ANKI_CONFIRMATION_MODE` asks for one |
+| Write that may force a full sync: `anki_note_type_fields_update`, `anki_templates_update` | `conditional` | `destructiveHint` | The preview's `full_sync_required` says whether this call forces one. Renames and text or CSS edits sync normally. Adding, removing or reordering a field or template forces a full sync: the person is asked to approve it after syncing their other devices. Clients that cannot ask get `MANUAL_CHANGE_REQUIRED` with steps to make the change in Anki desktop instead. |
+| Write that forces a full sync: full upload and download | `full` | `destructiveHint` | A prompt to the person on every call. Clients that cannot show one are refused. A retry that replays a stored receipt changes nothing and does not ask. |
+
+As of November 2026 only Claude Code is known to render MCP elicitation prompts; claude.ai, Claude Desktop and the mobile apps do not, and some desktop sessions accept the request without ever showing it. For those clients the main safeguard is not registering destructive tools: leave `destructive` out of `MCP_SCOPES` and keep `ANKI_ALLOW_DESTRUCTIVE`, `ANKI_ALLOW_SCHEMA_CHANGES` and `ANKI_ALLOW_FULL_SYNC` off.
+
+When AnkiWeb asks for a full sync because another device changed a note type's structure, the server downloads AnkiWeb's copy automatically if it has nothing unsynced: Anki's last-modified time is not newer than its last sync, no content row is waiting to be sent, and none of its own writes failed to sync. It takes a backup first. Otherwise sync fails with `FULL_SYNC_REQUIRED`, `anki_operations_list` shows what would be lost, and `anki_sync_full_download` asks the person before discarding it. A collection that has never synced is left to `ANKI_BOOTSTRAP_MODE`.
+
+Theming a note type (name, CSS, template text) with `anki_note_types_create` or `anki_note_types_update` needs the `admin` scope and `ANKI_ALLOW_SCHEMA_CHANGES=true`. It syncs normally and works in every client. Structural changes through `anki_note_type_fields_update` or `anki_templates_update` also need `ANKI_ALLOW_FULL_SYNC=true` and, when they force a full sync, either a client that can show a prompt or the person making the change in Anki desktop from the returned steps. Plugins should treat theming as optional when those tools are not listed.
 
 ## Development
 

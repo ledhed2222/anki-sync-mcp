@@ -8,6 +8,7 @@ import sys
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from anki.collection import Collection
@@ -256,3 +257,78 @@ def test_large_media_sync_runs_in_background_and_status_stays_responsive(
 
     again = asyncio.run(sync_again())
     assert again["media_sync"]["state"] == "completed"
+
+
+def test_structural_change_from_another_device_downloads_only_when_nothing_is_unsynced(
+    official_sync_server: str, tmp_path: Path
+) -> None:
+    desktop_path = tmp_path / "desktop" / "collection.anki2"
+    desktop_path.parent.mkdir()
+    desktop = Collection(str(desktop_path))
+    note = desktop.new_note(desktop.models.by_name("Basic"))
+    note["Front"] = "front"
+    note["Back"] = "back"
+    desktop.add_note(note, desktop.decks.id("Desktop"))
+    auth = desktop.sync_login("phase1-user", "phase1-password", official_sync_server)
+
+    def desktop_uploads(change: Any) -> None:
+        model = desktop.models.by_name("Basic")
+        change(model)
+        desktop.models.update_dict(model)
+        output = desktop.sync_collection(auth, sync_media=False)
+        assert output.required in {2, 4}, output.required
+        desktop.full_upload_or_download(auth=auth, server_usn=None, upload=True)
+
+    def add_reverse(model: Any) -> None:
+        template = desktop.models.new_template("Reverse")
+        template["qfmt"] = "{{Back}}"
+        template["afmt"] = "{{Front}}"
+        desktop.models.add_template(model, template)
+
+    output = desktop.sync_collection(auth, sync_media=False)
+    desktop.full_upload_or_download(auth=auth, server_usn=output.server_media_usn, upload=True)
+
+    server_path = tmp_path / "server" / "collection.anki2"
+    server_path.parent.mkdir()
+    Collection(str(server_path)).close()
+
+    async def scenario() -> None:
+        async with AnkiCollectionService(
+            str(server_path), max_page_size=100, sync_on_write=False
+        ) as server:
+            await server.sync_login("phase1-user", "phase1-password", official_sync_server)
+            first = await server.sync(sync_media=False)
+            assert first["required"] == "FULL_DOWNLOAD"
+            assert first["full_download"] is None
+            await server.full_sync(upload=False)
+
+            desktop_uploads(add_reverse)
+            clean = await server.sync(sync_media=False)
+            assert clean["required"] == "NO_CHANGES"
+            assert clean["full_download"]["direction"] == "download"
+            basic = await server.coordinated_read(
+                lambda adapter: adapter.collection.models.by_name("Basic")
+            )
+            assert len(basic["tmpls"]) == 2
+
+            await server.coordinated_mutation(
+                operation="anki_notes_create",
+                idempotency_key="unsynced-on-server",
+                request={"front": "server only"},
+                mutate=lambda adapter: adapter.create_note(
+                    1, int(basic["id"]), {"Front": "server only", "Back": "x"}, []
+                ),
+            )
+            desktop_uploads(lambda model: desktop.models.remove_template(model, model["tmpls"][1]))
+            dirty = await server.sync(sync_media=False)
+            assert dirty["required"] == "FULL_SYNC"
+            assert dirty["full_download"] is None
+            kept = await server.coordinated_read(
+                lambda adapter: adapter.collection.find_notes('"front:server only"')
+            )
+            assert len(kept) == 1
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        desktop.close()

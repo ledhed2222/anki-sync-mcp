@@ -18,6 +18,8 @@ from anki_mcp.app import create_app
 from anki_mcp.collection import CollectionAdapter, ResourceLimitError
 from anki_mcp.config import Settings
 
+pytestmark = pytest.mark.usefixtures("person_approves")
+
 
 @pytest.fixture
 def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
@@ -258,7 +260,6 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_note_types_update",
         "anki_note_type_fields_update",
         "anki_templates_update",
-        "anki_note_types_delete",
         "anki_media_list",
         "anki_media_get",
         "anki_media_check",
@@ -445,7 +446,6 @@ def test_exact_tool_inventory(client: TestClient) -> None:
         "anki_cards_delete",
         "anki_notes_delete",
         "anki_tags_delete",
-        "anki_note_types_delete",
         "anki_media_delete",
     ):
         assert by_name[name]["inputSchema"]["properties"]["confirmation_token"]["type"] == "string"
@@ -1191,14 +1191,6 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
     call("anki_tags_delete", {"name": "protocol-new", "confirmation_token": tag_token})
     note_token = call("anki_notes_delete_preview", {"note_ids": [note_id]})["confirmation_token"]
     call("anki_notes_delete", {"note_ids": [note_id], "confirmation_token": note_token})
-    type_token = call(
-        "anki_note_types_change_preview",
-        {"operation": "delete", "note_type_id": note_type_id},
-    )["confirmation_token"]
-    call(
-        "anki_note_types_delete",
-        {"note_type_id": note_type_id, "confirmation_token": type_token},
-    )
     resource_deck_token = call("anki_decks_delete_preview", {"deck_id": resources_deck_id})[
         "confirmation_token"
     ]
