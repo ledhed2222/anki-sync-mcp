@@ -162,6 +162,10 @@ uv run ruff check .
 uv run pyright
 ```
 
+Pushing a `v*` tag publishes a multi-architecture image (`linux/amd64`, `linux/arm64`) to
+`ghcr.io/<owner>/<repo>`, tagged with the version and the commit SHA. Pull requests that touch
+the image's inputs build it without publishing.
+
 ## License
 
 [MIT](LICENSE) — free to use, modify, and distribute under the license terms.
