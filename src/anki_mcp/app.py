@@ -462,6 +462,7 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.sync_timeout_seconds,
         settings.sync_on_read,
         settings.sync_on_write,
+        settings.media_sync_wait_seconds,
     )
     oauth_provider: BuiltinOAuthProvider | None = None
     auth_settings: AuthSettings | None = None
@@ -686,7 +687,12 @@ def create_app(settings: Settings) -> ASGIApp:
 
     @scoped_tool(name="anki_sync", scope="write")
     async def sync(sync_media: SyncMedia = True) -> dict[str, Any]:
-        """Synchronize the collection with the authenticated remote server."""
+        """Synchronize the collection with the authenticated remote server.
+
+        Media sync runs in the background and is not waited on past a short bound. Check
+        `media_sync.state` in the result: `in_progress` means it is still running (call
+        `anki_status` to follow it), `completed` means it finished, `failed` carries an error code.
+        """
         return await execute(service.sync(sync_media))
 
     @scoped_tool(name="anki_sync_full_download", scope="admin", enabled=settings.allow_full_sync)

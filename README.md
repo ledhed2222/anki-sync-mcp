@@ -81,7 +81,7 @@ Compose file, add it under `services.anki-mcp.environment`.
 | `MCP_SCOPES` | `read,write,admin` | Comma-separated tool groups to register. Allowed values are `read`, `write`, `admin`, and `destructive`. Destructive tools require both the `destructive` scope and their feature flag. |
 | `MCP_ALLOWED_HOSTS` | `testserver,localhost,localhost:*,127.0.0.1,127.0.0.1:*,anki-mcp,anki-mcp:*` | Comma-separated HTTP `Host` patterns accepted by MCP DNS-rebinding protection. Add the service name or hostname used by remote clients. |
 | `MCP_ALLOWED_ORIGINS` | `http://localhost:*,http://127.0.0.1:*` | Comma-separated browser origins accepted by MCP transport security. Add explicit trusted origins when using a browser-based client. |
-| `LOG_LEVEL` | `INFO` | Log level for the server and Uvicorn, such as `debug`, `info`, `warning`, or `error`. `debug` also logs diagnostics such as redirect URIs refused during OAuth client registration. |
+| `LOG_LEVEL` | `INFO` | Log level for the server and Uvicorn, such as `debug`, `info`, `warning`, or `error`. `debug` also logs diagnostics such as redirect URIs refused during OAuth client registration, and the media sync lifecycle (start, progress, wait, abort) under the `anki_mcp.media_sync` logger. Media sync completion is logged at `info` and failures at `warning` with an error code and exception type, never the backend message. |
 
 The `/health/live` and `/health/ready` endpoints are not bearer-authenticated. The supplied
 Compose network keeps them private unless you publish the container port.
@@ -123,7 +123,8 @@ internet-facing server exposes.
 | `ANKI_SYNC_HOST` | empty (AnkiWeb) | Custom sync-server HTTP(S) base URL. Non-loopback servers require HTTPS; credentials, query strings, and fragments are rejected. |
 | `ANKI_SYNC_ON_READ` | `false` | Synchronize before coordinated reads. Individual read tools can still request a sync with `sync_before=true`. |
 | `ANKI_SYNC_ON_WRITE` | `true` | Synchronize before and after coordinated mutations. Disabling this permits local changes to remain unsynchronized. |
-| `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Maximum wait for media synchronization (`> 0`, up to `3600` seconds). |
+| `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Seconds a background media sync may go without reporting progress before it is aborted (`> 0`, up to `3600`). A sync that keeps advancing is never cut off; an aborted one resumes from the files already transferred on the next sync. |
+| `ANKI_MEDIA_SYNC_WAIT_SECONDS` | `10` | How long `anki_sync` waits for media synchronization before returning `media_sync.state = "in_progress"` (`0`-`60` seconds; `0` returns immediately). Media sync continues in the background; follow it with `anki_status`. |
 | `ANKI_BOOTSTRAP_MODE` | `disabled` | Startup behavior: `disabled`, or `download_if_empty` to authenticate and perform a download-only initialization when the local collection is empty. A non-empty collection is left untouched and the server starts normally, so the setting can stay on across restarts. Startup fails rather than uploading if the server requests a full upload. |
 
 The persisted `anki_data` volume also contains synchronization authentication state, mutation

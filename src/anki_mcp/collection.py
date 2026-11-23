@@ -24,7 +24,15 @@ from anki.collection import AddNoteRequest, Collection
 from anki.config_pb2 import ConfigKey
 from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
 from anki.decks import UpdateDeckConfigs
-from anki.errors import InvalidInput, NetworkError, NotFoundError, SearchError
+from anki.errors import (
+    Interrupted,
+    InvalidInput,
+    NetworkError,
+    NotFoundError,
+    SearchError,
+    SyncError,
+    SyncErrorKind,
+)
 from anki.scheduler_pb2 import SimulateFsrsReviewRequest
 from anki.sync import SyncAuth
 from anki.utils import field_checksum
@@ -41,6 +49,7 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 AUDIT_LOGGER = logging.getLogger("anki_mcp.audit")
+MEDIA_SYNC_LOGGER = logging.getLogger("anki_mcp.media_sync")
 SYNC_REQUIRED_NAMES = (
     "NO_CHANGES",
     "NORMAL_SYNC",
@@ -48,6 +57,8 @@ SYNC_REQUIRED_NAMES = (
     "FULL_DOWNLOAD",
     "FULL_UPLOAD",
 )
+MEDIA_SYNC_POLL_SECONDS = 0.1
+MEDIA_SYNC_ABORT_GRACE_SECONDS = 1.0
 DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
     "learning": (
         "learn_steps",
@@ -141,6 +152,7 @@ class CollectionAdapter:
         sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
+        media_sync_wait_seconds: float = 10,
     ) -> None:
         if anki.lang.current_i18n is None:
             anki.lang.set_lang("en_US")
@@ -154,6 +166,14 @@ class CollectionAdapter:
         self.sync_timeout_seconds = sync_timeout_seconds
         self.sync_on_read = sync_on_read
         self.sync_on_write = sync_on_write
+        self.media_sync_wait_seconds = media_sync_wait_seconds
+        # Anki runs media sync on its own backend thread. These fields track the run that this
+        # process started so that completion and failure are recorded even when no caller waits.
+        self._media_sync_running = False
+        self._media_sync_state = "idle"
+        self._media_sync_error: str | None = None
+        self._media_progress_changed_at = time.monotonic()
+        self._media_sync_started_at = time.monotonic()
         self._backup_folder = Path(path).parent / "backups"
         self._state = PersistentState(path)
         persisted_auth = self._state.load_sync_auth()
@@ -222,6 +242,9 @@ class CollectionAdapter:
 
     def status(self) -> dict[str, Any]:
         collection_ready = self.check_ready()
+        if self._media_sync_running:
+            # Record completion or failure of a background media sync nobody is waiting on.
+            self._poll_media_sync()
         pending_name = (
             SYNC_REQUIRED_NAMES[self._pending_full_sync[0]]
             if self._pending_full_sync is not None
@@ -247,6 +270,7 @@ class CollectionAdapter:
             "last_sync_at": self._last_sync_at,
             "last_media_sync_at": self._last_media_sync_at,
             "media_sync_progress": self._media_sync_progress,
+            "media_sync": self._media_sync_snapshot(),
             "pending_mutations": self._state.pending_receipt_count(),
         }
 
@@ -457,15 +481,20 @@ class CollectionAdapter:
                 and (not receipt.get("remote_synced") or media_pending)
             ):
                 try:
-                    self._sync_or_raise_full_sync(sync_media=sync_media or media_pending)
+                    retry_sync = self._sync_or_raise_full_sync(
+                        sync_media=sync_media or media_pending
+                    )
                 except FullSyncRequiredError:
                     receipt["retryable"] = False
                     self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
                     raise
                 receipt["remote_synced"] = True
+                media_done = self._media_sync_done(retry_sync)
                 if media_pending:
-                    receipt["media_synced"] = True
-                receipt["retryable"] = False
+                    receipt["media_synced"] = media_done
+                # A media sync still in progress leaves the receipt retryable, so a later
+                # retry with the same idempotency key can confirm it finished.
+                receipt["retryable"] = media_pending and not media_done
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
             audit(receipt)
             return receipt
@@ -499,7 +528,7 @@ class CollectionAdapter:
         self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
         if self.sync_on_write:
             try:
-                self._sync_or_raise_full_sync(sync_media=sync_media)
+                write_sync = self._sync_or_raise_full_sync(sync_media=sync_media)
             except FullSyncRequiredError:
                 receipt["remote_synced"] = False
                 self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
@@ -512,7 +541,9 @@ class CollectionAdapter:
                 return receipt
             receipt["remote_synced"] = True
             if sync_media:
-                receipt["media_synced"] = True
+                media_done = self._media_sync_done(write_sync)
+                receipt["media_synced"] = media_done
+                receipt["retryable"] = not media_done
             self._state.put_receipt(idempotency_key, operation, request_hash, receipt)
         audit(receipt)
         return receipt
@@ -2940,10 +2971,124 @@ class CollectionAdapter:
         )
         return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
 
-    def _wait_for_media_sync(self) -> dict[str, Any]:
-        deadline = time.monotonic() + self.sync_timeout_seconds
-        while True:
-            status = self.collection._backend.media_sync_status()  # pyright: ignore[reportPrivateUsage]
+    def _media_sync_snapshot(self) -> dict[str, Any]:
+        """Describe the media sync this process last started, without touching the backend."""
+        progress = self._media_sync_progress or {}
+        return {
+            "state": self._media_sync_state,
+            "completed": self._media_sync_state == "completed",
+            "in_progress": self._media_sync_state == "in_progress",
+            "error": self._media_sync_error,
+            "checked": progress.get("checked", ""),
+            "added": progress.get("added", ""),
+            "removed": progress.get("removed", ""),
+        }
+
+    @staticmethod
+    def _media_sync_done(result: dict[str, Any]) -> bool:
+        """Whether a sync result shows media fully synchronized (or not requested)."""
+        media = result.get("media_sync")
+        return media is None or bool(media.get("completed"))
+
+    @staticmethod
+    def _media_sync_error_code(exc: Exception) -> str:
+        if isinstance(exc, NetworkError):
+            return "NETWORK_ERROR"
+        if isinstance(exc, SyncError):
+            return "AUTHENTICATION_FAILED" if exc.kind == SyncErrorKind.AUTH else "SYNC_ERROR"
+        if isinstance(exc, Interrupted):
+            return "INTERRUPTED"
+        return "MEDIA_SYNC_FAILED"
+
+    def _media_sync_elapsed(self) -> float:
+        return time.monotonic() - self._media_sync_started_at
+
+    def _track_media_sync(self, source: str) -> None:
+        """Record that Anki's backend has started (or is already running) a media sync."""
+        if not self._media_sync_running:
+            now = time.monotonic()
+            self._media_sync_running = True
+            self._media_progress_changed_at = now
+            self._media_sync_started_at = now
+            MEDIA_SYNC_LOGGER.debug("media sync started source=%s", source)
+        else:
+            MEDIA_SYNC_LOGGER.debug(
+                "media sync already running source=%s elapsed=%.1fs",
+                source,
+                self._media_sync_elapsed(),
+            )
+        self._media_sync_state = "in_progress"
+        self._media_sync_error = None
+
+    def _fail_media_sync(self, code: str, detail: str = "") -> None:
+        MEDIA_SYNC_LOGGER.warning(
+            "media sync failed code=%s detail=%s elapsed=%.1fs checked=%s added=%s removed=%s",
+            code,
+            detail or "-",
+            self._media_sync_elapsed(),
+            *self._media_sync_counts(),
+        )
+        self._media_sync_running = False
+        self._media_sync_state = "failed"
+        self._media_sync_error = code
+
+    def _media_sync_counts(self) -> tuple[str, str, str]:
+        progress = self._media_sync_progress or {}
+        return (
+            progress.get("checked", ""),
+            progress.get("added", ""),
+            progress.get("removed", ""),
+        )
+
+    def _abort_media_sync(self) -> bool:
+        """Abort the backend media sync and give its thread a moment to exit.
+
+        Returns False when the abort request itself failed. A later sync resumes from the
+        files already transferred, so aborting a stalled run loses no completed work.
+        """
+        try:
+            self.collection.abort_media_sync()
+        except Exception as exc:
+            MEDIA_SYNC_LOGGER.debug(
+                "media sync abort request failed error_type=%s", type(exc).__name__
+            )
+            return False
+        MEDIA_SYNC_LOGGER.debug("media sync abort requested")
+        deadline = time.monotonic() + MEDIA_SYNC_ABORT_GRACE_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                if not self.collection.media_sync_status().active:
+                    MEDIA_SYNC_LOGGER.debug("media sync thread exited after abort")
+                    break
+            except Exception as exc:
+                # an aborted run reports its interruption exactly once
+                MEDIA_SYNC_LOGGER.debug(
+                    "media sync thread exited after abort error_type=%s", type(exc).__name__
+                )
+                break
+            time.sleep(0.05)
+        else:
+            MEDIA_SYNC_LOGGER.debug(
+                "media sync thread still active %.1fs after abort", MEDIA_SYNC_ABORT_GRACE_SECONDS
+            )
+        return True
+
+    def _poll_media_sync(self, *, raise_on_failure: bool = False) -> dict[str, Any]:
+        """Advance the tracked media sync state from the backend without waiting on it.
+
+        Anki runs media sync on its own thread and raises that thread's error exactly once, from
+        the first status call after it ends. This is the only place that status is read, so a
+        failure is always captured here instead of being lost to whichever caller polls first.
+        """
+        try:
+            status = self.collection.media_sync_status()
+        except Exception as exc:
+            # Log the exception type only: backend messages can carry server addresses.
+            self._fail_media_sync(self._media_sync_error_code(exc), type(exc).__name__)
+            if raise_on_failure:
+                raise
+            return self._media_sync_snapshot()
+        if status.HasField("progress"):
             progress = {
                 "checked": str(status.progress.checked),
                 "added": str(status.progress.added),
@@ -2951,22 +3096,80 @@ class CollectionAdapter:
             }
             if progress != self._media_sync_progress:
                 self._media_sync_progress = progress
+                self._media_progress_changed_at = time.monotonic()
                 self._save_operational_status()
-            if not status.active:
-                self._last_media_sync_at = datetime.now(UTC).isoformat()
-                self._save_operational_status()
-                return {"completed": True, **progress}
-            if time.monotonic() >= deadline:
-                try:
-                    self.collection.abort_media_sync()
-                except Exception as exc:
-                    raise MediaSyncFailedError(
-                        "media synchronization timed out and could not be aborted"
-                    ) from exc
-                raise MediaSyncFailedError(
-                    "media synchronization did not complete before the sync timeout"
+                MEDIA_SYNC_LOGGER.debug(
+                    "media sync progress checked=%s added=%s removed=%s active=%s elapsed=%.1fs",
+                    progress["checked"],
+                    progress["added"],
+                    progress["removed"],
+                    status.active,
+                    self._media_sync_elapsed(),
                 )
-            time.sleep(0.05)
+        if status.active:
+            self._media_sync_state = "in_progress"
+            idle_seconds = time.monotonic() - self._media_progress_changed_at
+            if idle_seconds > self.sync_timeout_seconds:
+                # Only a run that stopped reporting progress is aborted; a long sync that keeps
+                # advancing is left to finish however long it takes.
+                MEDIA_SYNC_LOGGER.debug(
+                    "media sync stalled idle=%.1fs timeout=%.1fs; aborting",
+                    idle_seconds,
+                    self.sync_timeout_seconds,
+                )
+                aborted = self._abort_media_sync()
+                self._fail_media_sync("STALLED" if aborted else "STALLED_NOT_ABORTED")
+                if raise_on_failure:
+                    raise MediaSyncFailedError(
+                        "media synchronization made no progress before the sync timeout"
+                        if aborted
+                        else "media synchronization stalled and could not be aborted"
+                    )
+        elif self._media_sync_running:
+            self._media_sync_running = False
+            self._media_sync_state = "completed"
+            self._media_sync_error = None
+            self._last_media_sync_at = datetime.now(UTC).isoformat()
+            self._save_operational_status()
+            MEDIA_SYNC_LOGGER.info(
+                "media sync completed elapsed=%.1fs checked=%s added=%s removed=%s",
+                self._media_sync_elapsed(),
+                *self._media_sync_counts(),
+            )
+        return self._media_sync_snapshot()
+
+    def _settle_media_sync(self, started: bool) -> dict[str, Any]:
+        """Wait briefly for a just-started media sync, then report whatever state it is in.
+
+        The wait is bounded by media_sync_wait_seconds so the single collection thread (and the
+        caller's HTTP request) is never held for the duration of a large media sync.
+        """
+        if not started:
+            # Anki starts no media sync when the server requires a full sync first.
+            MEDIA_SYNC_LOGGER.debug("media sync not started: server requires a full sync first")
+            return {
+                **self._media_sync_snapshot(),
+                "state": "not_started",
+                "completed": False,
+                "in_progress": False,
+            }
+        self._track_media_sync("sync")
+        wait_started = time.monotonic()
+        deadline = wait_started + self.media_sync_wait_seconds
+        polls = 0
+        MEDIA_SYNC_LOGGER.debug("media sync wait begin budget=%.1fs", self.media_sync_wait_seconds)
+        while True:
+            polls += 1
+            snapshot = self._poll_media_sync(raise_on_failure=True)
+            if not snapshot["in_progress"] or time.monotonic() >= deadline:
+                MEDIA_SYNC_LOGGER.debug(
+                    "media sync wait end state=%s waited=%.2fs polls=%d",
+                    snapshot["state"],
+                    time.monotonic() - wait_started,
+                    polls,
+                )
+                return snapshot
+            time.sleep(min(MEDIA_SYNC_POLL_SECONDS, max(deadline - time.monotonic(), 0)))
 
     def sync(self, sync_media: bool) -> dict[str, Any]:
         if self._sync_auth is None:
@@ -2995,7 +3198,11 @@ class CollectionAdapter:
             )
             self._save_operational_status()
             required = SYNC_REQUIRED_NAMES[output.required]
-            media_sync = self._wait_for_media_sync() if sync_media else None
+            media_sync = (
+                self._settle_media_sync(started=output.required not in {2, 3, 4})
+                if sync_media
+                else None
+            )
             server_message, server_message_truncated = self._truncate_rendered(
                 output.server_message
             )
@@ -3041,6 +3248,9 @@ class CollectionAdapter:
             raise
         self._pending_full_sync = None
         self._last_sync_at = datetime.now(UTC).isoformat()
+        if server_usn is not None:
+            # A successful full sync restarts media sync in the background; status reports it.
+            self._track_media_sync("full_sync")
         if upload:
             self._state.mark_all_remote_synced()
         else:
@@ -3075,6 +3285,7 @@ class CollectionExecutor:
         sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
+        media_sync_wait_seconds: float = 10,
     ) -> None:
         self._path = path
         self._max_page_size = max_page_size
@@ -3086,6 +3297,7 @@ class CollectionExecutor:
         self._sync_timeout_seconds = sync_timeout_seconds
         self._sync_on_read = sync_on_read
         self._sync_on_write = sync_on_write
+        self._media_sync_wait_seconds = media_sync_wait_seconds
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
         self._adapter: CollectionAdapter | None = None
         self._worker_id: int | None = None
@@ -3109,6 +3321,7 @@ class CollectionExecutor:
                 self._sync_timeout_seconds,
                 self._sync_on_read,
                 self._sync_on_write,
+                self._media_sync_wait_seconds,
             )
 
         self._pool.submit(open_collection).result()
@@ -3148,6 +3361,7 @@ class AnkiCollectionService:
         sync_timeout_seconds: float = 300,
         sync_on_read: bool = False,
         sync_on_write: bool = False,
+        media_sync_wait_seconds: float = 10,
     ) -> None:
         self.executor = CollectionExecutor(
             path,
@@ -3160,6 +3374,7 @@ class AnkiCollectionService:
             sync_timeout_seconds,
             sync_on_read,
             sync_on_write,
+            media_sync_wait_seconds,
         )
 
     async def __aenter__(self) -> AnkiCollectionService:
