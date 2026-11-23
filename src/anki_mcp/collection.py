@@ -49,6 +49,7 @@ if TYPE_CHECKING:
 
 T = TypeVar("T")
 AUDIT_LOGGER = logging.getLogger("anki_mcp.audit")
+MEDIA_SYNC_LOGGER = logging.getLogger("anki_mcp.media_sync")
 SYNC_REQUIRED_NAMES = (
     "NO_CHANGES",
     "NORMAL_SYNC",
@@ -172,6 +173,7 @@ class CollectionAdapter:
         self._media_sync_state = "idle"
         self._media_sync_error: str | None = None
         self._media_progress_changed_at = time.monotonic()
+        self._media_sync_started_at = time.monotonic()
         self._backup_folder = Path(path).parent / "backups"
         self._state = PersistentState(path)
         persisted_auth = self._state.load_sync_auth()
@@ -2998,18 +3000,45 @@ class CollectionAdapter:
             return "INTERRUPTED"
         return "MEDIA_SYNC_FAILED"
 
-    def _track_media_sync(self) -> None:
+    def _media_sync_elapsed(self) -> float:
+        return time.monotonic() - self._media_sync_started_at
+
+    def _track_media_sync(self, source: str) -> None:
         """Record that Anki's backend has started (or is already running) a media sync."""
         if not self._media_sync_running:
+            now = time.monotonic()
             self._media_sync_running = True
-            self._media_progress_changed_at = time.monotonic()
+            self._media_progress_changed_at = now
+            self._media_sync_started_at = now
+            MEDIA_SYNC_LOGGER.debug("media sync started source=%s", source)
+        else:
+            MEDIA_SYNC_LOGGER.debug(
+                "media sync already running source=%s elapsed=%.1fs",
+                source,
+                self._media_sync_elapsed(),
+            )
         self._media_sync_state = "in_progress"
         self._media_sync_error = None
 
-    def _fail_media_sync(self, code: str) -> None:
+    def _fail_media_sync(self, code: str, detail: str = "") -> None:
+        MEDIA_SYNC_LOGGER.warning(
+            "media sync failed code=%s detail=%s elapsed=%.1fs checked=%s added=%s removed=%s",
+            code,
+            detail or "-",
+            self._media_sync_elapsed(),
+            *self._media_sync_counts(),
+        )
         self._media_sync_running = False
         self._media_sync_state = "failed"
         self._media_sync_error = code
+
+    def _media_sync_counts(self) -> tuple[str, str, str]:
+        progress = self._media_sync_progress or {}
+        return (
+            progress.get("checked", ""),
+            progress.get("added", ""),
+            progress.get("removed", ""),
+        )
 
     def _abort_media_sync(self) -> bool:
         """Abort the backend media sync and give its thread a moment to exit.
@@ -3019,16 +3048,29 @@ class CollectionAdapter:
         """
         try:
             self.collection.abort_media_sync()
-        except Exception:
+        except Exception as exc:
+            MEDIA_SYNC_LOGGER.debug(
+                "media sync abort request failed error_type=%s", type(exc).__name__
+            )
             return False
+        MEDIA_SYNC_LOGGER.debug("media sync abort requested")
         deadline = time.monotonic() + MEDIA_SYNC_ABORT_GRACE_SECONDS
         while time.monotonic() < deadline:
             try:
                 if not self.collection.media_sync_status().active:
+                    MEDIA_SYNC_LOGGER.debug("media sync thread exited after abort")
                     break
-            except Exception:
-                break  # an aborted run reports its interruption exactly once
+            except Exception as exc:
+                # an aborted run reports its interruption exactly once
+                MEDIA_SYNC_LOGGER.debug(
+                    "media sync thread exited after abort error_type=%s", type(exc).__name__
+                )
+                break
             time.sleep(0.05)
+        else:
+            MEDIA_SYNC_LOGGER.debug(
+                "media sync thread still active %.1fs after abort", MEDIA_SYNC_ABORT_GRACE_SECONDS
+            )
         return True
 
     def _poll_media_sync(self, *, raise_on_failure: bool = False) -> dict[str, Any]:
@@ -3041,7 +3083,8 @@ class CollectionAdapter:
         try:
             status = self.collection.media_sync_status()
         except Exception as exc:
-            self._fail_media_sync(self._media_sync_error_code(exc))
+            # Log the exception type only: backend messages can carry server addresses.
+            self._fail_media_sync(self._media_sync_error_code(exc), type(exc).__name__)
             if raise_on_failure:
                 raise
             return self._media_sync_snapshot()
@@ -3055,12 +3098,25 @@ class CollectionAdapter:
                 self._media_sync_progress = progress
                 self._media_progress_changed_at = time.monotonic()
                 self._save_operational_status()
+                MEDIA_SYNC_LOGGER.debug(
+                    "media sync progress checked=%s added=%s removed=%s active=%s elapsed=%.1fs",
+                    progress["checked"],
+                    progress["added"],
+                    progress["removed"],
+                    status.active,
+                    self._media_sync_elapsed(),
+                )
         if status.active:
             self._media_sync_state = "in_progress"
             idle_seconds = time.monotonic() - self._media_progress_changed_at
             if idle_seconds > self.sync_timeout_seconds:
                 # Only a run that stopped reporting progress is aborted; a long sync that keeps
                 # advancing is left to finish however long it takes.
+                MEDIA_SYNC_LOGGER.debug(
+                    "media sync stalled idle=%.1fs timeout=%.1fs; aborting",
+                    idle_seconds,
+                    self.sync_timeout_seconds,
+                )
                 aborted = self._abort_media_sync()
                 self._fail_media_sync("STALLED" if aborted else "STALLED_NOT_ABORTED")
                 if raise_on_failure:
@@ -3075,6 +3131,11 @@ class CollectionAdapter:
             self._media_sync_error = None
             self._last_media_sync_at = datetime.now(UTC).isoformat()
             self._save_operational_status()
+            MEDIA_SYNC_LOGGER.info(
+                "media sync completed elapsed=%.1fs checked=%s added=%s removed=%s",
+                self._media_sync_elapsed(),
+                *self._media_sync_counts(),
+            )
         return self._media_sync_snapshot()
 
     def _settle_media_sync(self, started: bool) -> dict[str, Any]:
@@ -3085,17 +3146,28 @@ class CollectionAdapter:
         """
         if not started:
             # Anki starts no media sync when the server requires a full sync first.
+            MEDIA_SYNC_LOGGER.debug("media sync not started: server requires a full sync first")
             return {
                 **self._media_sync_snapshot(),
                 "state": "not_started",
                 "completed": False,
                 "in_progress": False,
             }
-        self._track_media_sync()
-        deadline = time.monotonic() + self.media_sync_wait_seconds
+        self._track_media_sync("sync")
+        wait_started = time.monotonic()
+        deadline = wait_started + self.media_sync_wait_seconds
+        polls = 0
+        MEDIA_SYNC_LOGGER.debug("media sync wait begin budget=%.1fs", self.media_sync_wait_seconds)
         while True:
+            polls += 1
             snapshot = self._poll_media_sync(raise_on_failure=True)
             if not snapshot["in_progress"] or time.monotonic() >= deadline:
+                MEDIA_SYNC_LOGGER.debug(
+                    "media sync wait end state=%s waited=%.2fs polls=%d",
+                    snapshot["state"],
+                    time.monotonic() - wait_started,
+                    polls,
+                )
                 return snapshot
             time.sleep(min(MEDIA_SYNC_POLL_SECONDS, max(deadline - time.monotonic(), 0)))
 
@@ -3178,7 +3250,7 @@ class CollectionAdapter:
         self._last_sync_at = datetime.now(UTC).isoformat()
         if server_usn is not None:
             # A successful full sync restarts media sync in the background; status reports it.
-            self._track_media_sync()
+            self._track_media_sync("full_sync")
         if upload:
             self._state.mark_all_remote_synced()
         else:

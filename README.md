@@ -81,7 +81,7 @@ Compose file, add it under `services.anki-mcp.environment`.
 | `MCP_SCOPES` | `read,write,admin` | Comma-separated tool groups to register. Allowed values are `read`, `write`, `admin`, and `destructive`. Destructive tools require both the `destructive` scope and their feature flag. |
 | `MCP_ALLOWED_HOSTS` | `testserver,localhost,localhost:*,127.0.0.1,127.0.0.1:*,anki-mcp,anki-mcp:*` | Comma-separated HTTP `Host` patterns accepted by MCP DNS-rebinding protection. Add the service name or hostname used by remote clients. |
 | `MCP_ALLOWED_ORIGINS` | `http://localhost:*,http://127.0.0.1:*` | Comma-separated browser origins accepted by MCP transport security. Add explicit trusted origins when using a browser-based client. |
-| `LOG_LEVEL` | `INFO` | Log level for the server and Uvicorn, such as `debug`, `info`, `warning`, or `error`. `debug` also logs diagnostics such as redirect URIs refused during OAuth client registration. |
+| `LOG_LEVEL` | `INFO` | Log level for the server and Uvicorn, such as `debug`, `info`, `warning`, or `error`. `debug` also logs diagnostics such as redirect URIs refused during OAuth client registration, and the media sync lifecycle (start, progress, wait, abort) under the `anki_mcp.media_sync` logger. Media sync completion is logged at `info` and failures at `warning` with an error code and exception type, never the backend message. |
 
 The `/health/live` and `/health/ready` endpoints are not bearer-authenticated. The supplied
 Compose network keeps them private unless you publish the container port.

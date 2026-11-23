@@ -493,6 +493,70 @@ async def test_media_sync_failure_is_recorded_once_by_status(
 
 
 @pytest.mark.anyio
+async def test_media_sync_lifecycle_is_logged_without_backend_messages(
+    phase2_collection: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="anki_mcp.media_sync")
+    statuses = iter([_media_status(True, "10", "4"), _media_status(False, "30", "12")])
+    _patch_sync(monkeypatch)
+    monkeypatch.setattr("anki._backend.RustBackend.media_sync_status", lambda self: next(statuses))
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, media_sync_wait_seconds=0
+    ) as service:
+        await service.sync_login("user", "password", None)
+        await service.sync(sync_media=True)
+        await service.status()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(m.startswith("media sync started source=sync") for m in messages)
+    assert any("media sync wait begin budget=0.0s" in m for m in messages)
+    assert any(
+        "media sync progress checked=10 added=4 removed=0 active=True" in m for m in messages
+    )
+    assert any("media sync wait end state=in_progress" in m for m in messages)
+    completed = [r for r in caplog.records if r.getMessage().startswith("media sync completed")]
+    assert len(completed) == 1
+    assert completed[0].levelno == logging.INFO
+    assert "checked=30 added=12 removed=0" in completed[0].getMessage()
+
+
+@pytest.mark.anyio
+async def test_media_sync_failure_is_logged_as_warning_without_the_backend_message(
+    phase2_collection: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="anki_mcp.media_sync")
+    calls: list[int] = []
+
+    def media_status(self: object) -> MediaSyncStatusResponse:
+        calls.append(1)
+        if len(calls) == 1:
+            return _media_status(True, "5", "1")
+        raise NetworkError("failed contacting https://secret-host.example/", None, None, None)
+
+    _patch_sync(monkeypatch)
+    monkeypatch.setattr("anki._backend.RustBackend.media_sync_status", media_status)
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, media_sync_wait_seconds=0
+    ) as service:
+        await service.sync_login("user", "password", None)
+        await service.sync(sync_media=True)
+        await service.status()
+
+    failures = [r for r in caplog.records if r.getMessage().startswith("media sync failed")]
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.WARNING
+    assert "code=NETWORK_ERROR" in failures[0].getMessage()
+    assert "detail=NetworkError" in failures[0].getMessage()
+    assert "secret-host" not in caplog.text
+
+
+@pytest.mark.anyio
 async def test_media_sync_is_not_started_when_full_sync_is_required(
     phase2_collection: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
