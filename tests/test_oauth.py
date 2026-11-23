@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import secrets
 from collections.abc import Iterator
 from urllib.parse import parse_qs, urlsplit
@@ -109,15 +110,17 @@ def test_builtin_mode_requires_https_public_url_and_hash(
         Settings(_env_file=None)
 
 
-def test_full_flow_and_rejections(client: TestClient) -> None:
+def test_full_flow_and_rejections(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
     assert client.post("/mcp", json=INITIALIZE).status_code == 401
     assert _mcp(client, "not-a-token") == 401
     metadata = client.get("/.well-known/oauth-authorization-server").json()
     assert metadata["issuer"].rstrip("/") == "http://localhost"
     assert client.get("/.well-known/oauth-protected-resource/mcp").status_code == 200
 
-    rogue = client.post("/register", json={"redirect_uris": ["https://evil.example/cb"]})
+    with caplog.at_level(logging.DEBUG, logger="anki_mcp.oauth"):
+        rogue = client.post("/register", json={"redirect_uris": ["https://evil.example/cb"]})
     assert rogue.status_code == 400
+    assert "https://evil.example/cb" in caplog.text
 
     client_id, secret = _register(client)
     verifier = secrets.token_urlsafe(48)
