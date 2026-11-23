@@ -113,6 +113,18 @@ class SyncLoginRequiredError(RuntimeError):
     """Raised when synchronization is requested before remote login."""
 
 
+_SYNC_TABLES = (
+    "notes",
+    "cards",
+    "revlog",
+    "graves",
+    "decks",
+    "deck_config",
+    "notetypes",
+    "tags",
+)
+
+
 class FullSyncRequiredError(RuntimeError):
     """Raised when a normal operation encounters a one-way sync requirement."""
 
@@ -552,7 +564,8 @@ class CollectionAdapter:
         result = self.sync(sync_media)
         if result["required"] in {"FULL_SYNC", "FULL_DOWNLOAD", "FULL_UPLOAD"}:
             raise FullSyncRequiredError(
-                f"{result['required']} requires operator-controlled full synchronization"
+                f"{result['required']} requires operator-controlled full synchronization; "
+                "this server has changes AnkiWeb does not, listed by anki_operations_list"
             )
         return result
 
@@ -631,11 +644,22 @@ class CollectionAdapter:
             raise RuntimeError("Anki did not return a deck ID")
         return {"id": int(deck_id), "created": True}
 
-    def update_deck(self, deck_id: int, name: str) -> dict[str, Any]:
+    def update_deck(
+        self, deck_id: int, name: str | None, description: str | None = None
+    ) -> dict[str, Any]:
         self.get_deck(deck_id)
-        if not name.strip():
-            raise ValueError("deck name must not be blank")
-        self.collection.decks.rename(cast("DeckId", deck_id), name)
+        if name is None and description is None:
+            raise ValueError("provide name, description, or both")
+        if name is not None:
+            if not name.strip():
+                raise ValueError("deck name must not be blank")
+            self.collection.decks.rename(cast("DeckId", deck_id), name)
+        if description is not None:
+            deck = self.collection.decks.get(cast("DeckId", deck_id))
+            if deck is None:  # pragma: no cover - checked above
+                raise LookupError(f"deck {deck_id} not found")
+            deck["desc"] = description
+            self.collection.decks.save(deck)
         return {"id": deck_id, "updated": True}
 
     def update_deck_config(
@@ -2165,16 +2189,13 @@ class CollectionAdapter:
         self.collection.models.update_dict(model)
         return {"id": note_type_id, "updated": True, "template_count": len(desired)}
 
-    def delete_note_type(self, note_type_id: int) -> dict[str, Any]:
-        model = self.collection.models.get(cast("NotetypeId", note_type_id))
-        if model is None:
-            raise LookupError(f"note type {note_type_id} not found")
-        note_count = int(self.collection.models.use_count(model))
-        self.collection.models.remove(cast("NotetypeId", note_type_id))
-        return {"id": note_type_id, "deleted": True, "deleted_notes": note_count}
-
-    def preview_note_type_change(self, operation: str, note_type_id: int | None) -> dict[str, Any]:
-        allowed = {"create", "update", "fields_update", "templates_update", "delete"}
+    def preview_note_type_change(
+        self,
+        operation: str,
+        note_type_id: int | None,
+        source_ordinals: list[int | None] | None = None,
+    ) -> dict[str, Any]:
+        allowed = {"create", "update", "fields_update", "templates_update"}
         if operation not in allowed:
             raise ValueError("unsupported note type change operation")
         note_count = 0
@@ -2215,11 +2236,26 @@ class CollectionAdapter:
             "note_type_id": note_type_id,
             "affected_notes": note_count,
             "backup_required": True,
-            "full_sync_required": True,
+            "full_sync_required": self._forces_full_sync(
+                operation, note_type_id, source_ordinals
+            ),
             "state_fingerprint": self._impact_fingerprint(
                 {"models": models, "current_model": current_model}
             ),
         }
+
+    def _forces_full_sync(
+        self, operation: str, note_type_id: int | None, source_ordinals: list[int | None] | None
+    ) -> bool:
+        # Measured: renames, CSS and template text sync normally; adding, removing or
+        # reordering a field or template changes the schema and forces a full sync.
+        if operation not in {"fields_update", "templates_update"} or note_type_id is None:
+            return False
+        model = self.collection.models.get(cast("NotetypeId", note_type_id))
+        if model is None:  # pragma: no cover - the caller validates the note type
+            raise LookupError(f"note type {note_type_id} not found")
+        current = model.get("flds" if operation == "fields_update" else "tmpls", [])
+        return source_ordinals != list(range(len(current)))
 
     def _media_path(self, filename: str, *, require_exists: bool) -> Path:
         if (
@@ -3198,6 +3234,11 @@ class CollectionAdapter:
             )
             self._save_operational_status()
             required = SYNC_REQUIRED_NAMES[output.required]
+            full_download = None
+            if output.required in {2, 3} and self._can_take_remote_copy():
+                # Nothing here is unsynced, so taking AnkiWeb's copy cannot lose anything.
+                full_download = self.full_sync(upload=False)
+                required = "NO_CHANGES"
             media_sync = (
                 self._settle_media_sync(started=output.required not in {2, 3, 4})
                 if sync_media
@@ -3214,11 +3255,30 @@ class CollectionAdapter:
                 "media_sync_requested": sync_media,
                 "media_sync": media_sync,
                 "endpoint_changed": endpoint_changed,
+                "full_download": full_download,
             }
         except Exception as exc:
             if not isinstance(exc, (NetworkError, TimeoutError)):
                 self._invalidate_sync_auth()
             raise
+
+    def _can_take_remote_copy(self) -> bool:
+        # A collection that never synced is left to ANKI_BOOTSTRAP_MODE.
+        db = self.collection.db
+        assert db is not None
+        return bool(db.scalar("select ls > 0 from col")) and not self._has_unsynced_changes()
+
+    def _has_unsynced_changes(self) -> bool:
+        # Anki's own test is mod > ls. Config rows are skipped: Anki leaves bookkeeping keys
+        # (curModel, nextPos) unsent indefinitely. Receipts cover this server's failed syncs.
+        db = self.collection.db
+        assert db is not None
+        if self._state.pending_receipt_count() or db.scalar("select mod > ls from col"):
+            return True
+        return any(
+            db.scalar(f"select exists(select 1 from {table} where usn = -1)")
+            for table in _SYNC_TABLES
+        )
 
     def full_sync(self, upload: bool) -> dict[str, Any]:
         if self._sync_auth is None:
@@ -3393,8 +3453,12 @@ class AnkiCollectionService:
     async def create_deck(self, name: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.create_deck(name))
 
-    async def update_deck(self, deck_id: int, name: str) -> dict[str, Any]:
-        return await self.executor.run(lambda adapter: adapter.update_deck(deck_id, name))
+    async def update_deck(
+        self, deck_id: int, name: str | None, description: str | None = None
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.update_deck(deck_id, name, description)
+        )
 
     async def update_deck_config(
         self,
@@ -3632,8 +3696,6 @@ class AnkiCollectionService:
             lambda adapter: adapter.update_templates(note_type_id, mappings)
         )
 
-    async def delete_note_type(self, note_type_id: int) -> dict[str, Any]:
-        return await self.executor.run(lambda adapter: adapter.delete_note_type(note_type_id))
 
     async def list_media(self, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.list_media(offset, limit))

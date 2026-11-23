@@ -8,10 +8,13 @@ from typing import Annotated, Any, Generic, Literal, NoReturn, TypeVar, cast
 from uuid import uuid4
 
 from anki.errors import NetworkError, SyncError, SyncErrorKind
+from anyio import move_on_after
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.transport_security import TransportSecuritySettings
+from mcp.shared.exceptions import McpError
+from mcp.types import ClientCapabilities, ElicitationCapability, ToolAnnotations
 from pydantic import (
     AnyHttpUrl,
     BaseModel,
@@ -70,7 +73,7 @@ Retention = Annotated[StrictFloat, Field(ge=0.7, le=0.99)]
 Tags = Annotated[list[Tag], Field(max_length=100)]
 NoteFields = dict[Annotated[StrictStr, Field(min_length=1, max_length=512)], CardText]
 ConfirmationToken = Annotated[StrictStr, Field(min_length=1, max_length=256)]
-SchemaChangeOperation = Literal["create", "update", "fields_update", "templates_update", "delete"]
+SchemaChangeOperation = Literal["create", "update", "fields_update", "templates_update"]
 ReviewRating = Annotated[StrictInt, Field(ge=1, le=4)]
 AnswerSeconds = Annotated[StrictInt, Field(ge=0, le=86_400)]
 ReviewOrder = Literal["newest", "oldest"]
@@ -187,6 +190,83 @@ AnswerAction = Literal[
     "ANSWER_ACTION_ANSWER_HARD",
     "ANSWER_ACTION_SHOW_REMINDER",
 ]
+
+
+_SYNC_META_KEY = "anki-mcp/sync"
+_FULL_SYNC_WARNING = (
+    "This forces a full sync. Sync every other device that has Anki changes first, "
+    "or those changes will be lost."
+)
+
+
+def _manual_note_type_steps(
+    operation: str, note_type: dict[str, Any], mappings: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Describe a structural note-type change so a person can make it in Anki desktop."""
+    templates = operation == "anki_templates_update"
+    kind = "templates" if templates else "fields"
+    current = {int(item["ordinal"]): str(item["name"]) for item in note_type[kind]}
+    target = []
+    for position, mapping in enumerate(mappings, start=1):
+        source = mapping["source_ordinal"]
+        changes = []
+        if source is None:
+            changes.append("add")
+        elif source + 1 != position:
+            changes.append(f"move from position {source + 1}")
+        if source is not None and mapping["name"] != current[source]:
+            changes.append(f"rename from {current[source]}")
+        entry: dict[str, Any] = {
+            "position": position,
+            "name": mapping["name"],
+            "change": ", ".join(changes) or "keep",
+        }
+        if templates:
+            entry["front"] = mapping["question_format"]
+            entry["back"] = mapping["answer_format"]
+        target.append(entry)
+    kept = {mapping["source_ordinal"] for mapping in mappings}
+    screen, tools = (
+        (
+            "Cards",
+            "Options > Add Card Type, Remove Card Type and Reposition, pasting each "
+            "front and back template",
+        )
+        if templates
+        else ("Fields", "Add, Delete, Rename and Reposition")
+    )
+    return {
+        "note_type": note_type["name"],
+        kind: target,
+        "remove": [name for ordinal, name in sorted(current.items()) if ordinal not in kept],
+        "steps": [
+            "Sync every device that has Anki changes, so none are lost.",
+            f"In Anki desktop open Tools > Manage Note Types, select {note_type['name']}, "
+            f"then click {screen}.",
+            f"Use {tools} until they match the list above, and remove the ones under 'remove'.",
+            "Anki warns that this needs a one-way sync. Accept, then sync and choose Upload.",
+            "This server downloads the change on its next sync.",
+        ],
+    }
+
+
+class _HumanConfirmation(BaseModel):
+    confirm: bool = Field(description="Apply this change")
+
+
+async def _ask_person(context: Context, message: str, timeout: float) -> bool | None:
+    """Return the person's answer, or None when the client cannot ask; silence is a no."""
+    if not context.session.check_client_capability(
+        ClientCapabilities(elicitation=ElicitationCapability())
+    ):
+        return None
+    with move_on_after(timeout):
+        try:
+            answer = await context.elicit(message, _HumanConfirmation)
+        except McpError:
+            return False
+        return answer.action == "accept" and answer.data is not None and answer.data.confirm
+    return False
 
 
 class NoteCreateInput(BaseModel):
@@ -482,7 +562,9 @@ def create_app(settings: Settings) -> ASGIApp:
         "anki-mcp",
         instructions="Authenticated sync and deck/card CRUD for one Anki collection.",
         streamable_http_path=settings.mcp_path,
-        json_response=True,
+        # The SDK drops server-to-client requests in JSON response mode, so elicitation needs SSE.
+        # Full-sync tools always ask the person, so registering them also needs SSE.
+        json_response=settings.confirmation_mode == "token" and not settings.allow_full_sync,
         transport_security=TransportSecuritySettings(
             enable_dns_rebinding_protection=True,
             allowed_hosts=settings.allowed_hosts,
@@ -492,14 +574,29 @@ def create_app(settings: Settings) -> ASGIApp:
         auth=auth_settings,
     )
     registered_tool_names: list[str] = []
+    conditional_sync_tool_names: set[str] = set()
     confirmations = ConfirmationRegistry(settings.confirmation_ttl_seconds)
 
     def scoped_tool(
-        name: str, scope: str, *, enabled: bool = True
+        name: str,
+        scope: str,
+        *,
+        enabled: bool = True,
+        destructive: bool = False,
+        sync: Literal["incremental", "conditional", "full"] = "incremental",
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def register(function: Callable[..., Any]) -> Callable[..., Any]:
             if scope in settings.scopes and enabled:
-                mcp.tool(name=name)(function)
+                read_only = scope == "read" or name.endswith("_preview")
+                annotations = ToolAnnotations(
+                    readOnlyHint=read_only,
+                    destructiveHint=destructive or sync != "incremental",
+                    idempotentHint=read_only,
+                )
+                meta = {_SYNC_META_KEY: "none" if read_only else sync}
+                mcp.tool(name=name, annotations=annotations, meta=meta)(function)
+                if sync == "conditional":
+                    conditional_sync_tool_names.add(name)
                 registered_tool_names.append(name)
             return function
 
@@ -511,13 +608,16 @@ def create_app(settings: Settings) -> ASGIApp:
         cause: Exception,
         *,
         log_cause: bool = False,
+        details: dict[str, Any] | None = None,
     ) -> NoReturn:
         correlation_id = str(uuid4())
-        payload = {
+        payload: dict[str, Any] = {
             "code": code,
             "message": message,
             "correlation_id": correlation_id,
         }
+        if details is not None:
+            payload["details"] = details
         if log_cause:
             LOGGER.error(
                 "tool failure code=%s correlation_id=%s exception_type=%s",
@@ -610,6 +710,40 @@ def create_app(settings: Settings) -> ASGIApp:
             "expires_in_seconds": settings.confirmation_ttl_seconds,
         }
 
+    async def confirm_with_human(
+        operation: str,
+        details: dict[str, Any],
+        *,
+        always: bool = False,
+        manual: Callable[[], Awaitable[dict[str, Any]]] | None = None,
+    ) -> None:
+        """Ask the person to approve a call; `always` (full syncs) ignores the mode."""
+        if settings.confirmation_mode == "token" and not always:
+            return
+        warning = f"\n\n{_FULL_SYNC_WARNING}" if always else ""
+        message = f"Allow {operation}?{warning}\n\n" + json.dumps(
+            details, ensure_ascii=False, indent=2
+        )
+        approved = await _ask_person(mcp.get_context(), message, settings.confirmation_ttl_seconds)
+        if approved is None:
+            if always and manual is not None:
+                cause = ConfirmationRequiredError(
+                    f"{operation} forces a full sync and this client cannot ask the person "
+                    "to approve it; give them these steps to make the change in Anki"
+                )
+                raise_tool_error(
+                    "MANUAL_CHANGE_REQUIRED", str(cause), cause, details=await manual()
+                )
+            if always or settings.confirmation_mode == "elicit_required":
+                cause = ConfirmationRequiredError(
+                    f"{operation} needs the person's approval and this client cannot ask"
+                )
+                raise_tool_error("DESTRUCTIVE_CONFIRMATION_REQUIRED", str(cause), cause)
+            return
+        if not approved:
+            cause = ConfirmationRequiredError(f"the person did not approve {operation}")
+            raise_tool_error("CONFIRMATION_DECLINED", str(cause), cause)
+
     async def guarded_mutate(
         operation: str,
         idempotency_key: str | None,
@@ -638,6 +772,27 @@ def create_app(settings: Settings) -> ASGIApp:
 
             return adapter.backup_before(confirmed_mutation)
 
+        # A spent token never mutates: it replays a stored receipt or the guard refuses it.
+        previewed = confirmations.describe(confirmation_token)
+        if previewed is not None:
+            change = guard_request.get("request", {})
+
+            async def manual_steps() -> dict[str, Any]:
+                note_type = await execute(
+                    service.coordinated_read(
+                        lambda adapter: adapter.get_note_type(change["note_type_id"])
+                    )
+                )
+                return _manual_note_type_steps(operation, note_type, change["mappings"])
+
+            manual = manual_steps if operation in conditional_sync_tool_names else None
+
+            await confirm_with_human(
+                operation,
+                previewed,
+                always=previewed["impact"].get("full_sync_required") is True,
+                manual=manual,
+            )
         return await mutate(
             operation,
             idempotency_key,
@@ -695,20 +850,39 @@ def create_app(settings: Settings) -> ASGIApp:
         """
         return await execute(service.sync(sync_media))
 
-    @scoped_tool(name="anki_sync_full_download", scope="admin", enabled=settings.allow_full_sync)
+    @scoped_tool(
+        name="anki_sync_full_download",
+        scope="admin",
+        enabled=settings.allow_full_sync,
+        sync="full",
+    )
     async def sync_full_download(confirm: Confirmation = False) -> dict[str, Any]:
         """Replace local data after the server requires a full download and confirmation is true."""
         if not confirm:
             cause = ValueError("confirm must be true for full download")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        pending = (await service.status())["pending_mutations"]
+        await confirm_with_human(
+            "anki_sync_full_download",
+            {"replaces": "local collection", "unsynced_operations_lost": pending},
+            always=True,
+        )
         return await execute(service.full_sync(upload=False))
 
-    @scoped_tool(name="anki_sync_full_upload", scope="admin", enabled=settings.allow_full_sync)
+    @scoped_tool(
+        name="anki_sync_full_upload",
+        scope="admin",
+        enabled=settings.allow_full_sync,
+        sync="full",
+    )
     async def sync_full_upload(confirm: Confirmation = False) -> dict[str, Any]:
         """Replace remote data after the server requires a full upload and confirmation is true."""
         if not confirm:
             cause = ValueError("confirm must be true for full upload")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        await confirm_with_human(
+            "anki_sync_full_upload", {"replaces": "remote collection"}, always=True
+        )
         return await execute(service.full_sync(upload=True))
 
     @scoped_tool(name="anki_backup_create", scope="admin")
@@ -790,18 +964,19 @@ def create_app(settings: Settings) -> ASGIApp:
     @scoped_tool(name="anki_decks_update", scope="write")
     async def decks_update(
         deck_id: StableId,
-        name: DeckName,
+        name: DeckName | None = None,
+        description: CardText | None = None,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Rename a deck by stable Anki deck ID."""
+        """Rename a deck, set its description, or both. Omitted values are left unchanged."""
         return await mutate(
             "anki_decks_update",
             idempotency_key,
-            {"deck_id": deck_id, "name": name},
-            lambda adapter: adapter.update_deck(deck_id, name),
+            {"deck_id": deck_id, "name": name, "description": description},
+            lambda adapter: adapter.update_deck(deck_id, name, description),
         )
 
-    @scoped_tool(name="anki_decks_update_config", scope="admin")
+    @scoped_tool(name="anki_decks_update_config", scope="admin", destructive=True)
     async def decks_update_config(
         deck_id: StableId,
         new_cards_per_day: DailyLimit | None = None,
@@ -818,6 +993,7 @@ def create_app(settings: Settings) -> ASGIApp:
             "max_answer_seconds": max_answer_seconds,
             "desired_retention": desired_retention,
         }
+        await confirm_with_human("anki_decks_update_config", request)
         return await mutate(
             "anki_decks_update_config",
             idempotency_key,
@@ -831,7 +1007,7 @@ def create_app(settings: Settings) -> ASGIApp:
             ),
         )
 
-    @scoped_tool(name="anki_deck_limits_update", scope="admin")
+    @scoped_tool(name="anki_deck_limits_update", scope="admin", destructive=True)
     async def deck_limits_update(
         deck_id: StableId,
         update: DeckLimitUpdate,
@@ -849,6 +1025,7 @@ def create_app(settings: Settings) -> ASGIApp:
                 "clear_fields": list(update.clear_fields),
             },
         }
+        await confirm_with_human("anki_deck_limits_update", request)
         return await mutate(
             "anki_deck_limits_update",
             idempotency_key,
@@ -861,7 +1038,7 @@ def create_app(settings: Settings) -> ASGIApp:
             ),
         )
 
-    @scoped_tool(name="anki_scheduler_settings_update", scope="admin")
+    @scoped_tool(name="anki_scheduler_settings_update", scope="admin", destructive=True)
     async def scheduler_settings_update(
         apply_all_parent_limits: StrictBool | None = None,
         new_cards_ignore_review_limit: StrictBool | None = None,
@@ -874,6 +1051,7 @@ def create_app(settings: Settings) -> ASGIApp:
             "new_cards_ignore_review_limit": new_cards_ignore_review_limit,
             "fsrs_enabled": fsrs_enabled,
         }
+        await confirm_with_human("anki_scheduler_settings_update", request)
         return await mutate(
             "anki_scheduler_settings_update",
             idempotency_key,
@@ -905,7 +1083,7 @@ def create_app(settings: Settings) -> ASGIApp:
         )
         return FsrsOptimizationPreviewResult.model_validate(result)
 
-    @scoped_tool(name="anki_fsrs_optimize_apply", scope="admin")
+    @scoped_tool(name="anki_fsrs_optimize_apply", scope="admin", destructive=True)
     async def fsrs_optimize_apply(
         config_id: DeckPresetId,
         confirmation_token: ConfirmationToken,
@@ -935,6 +1113,9 @@ def create_app(settings: Settings) -> ASGIApp:
                 config_id, search, health_check, impact=current_impact
             )
 
+        previewed = confirmations.describe(confirmation_token)
+        if previewed is not None:
+            await confirm_with_human("anki_fsrs_optimize_apply", previewed)
         result = await mutate("anki_fsrs_optimize_apply", idempotency_key, request, guarded)
         return FsrsMutationReceipt[FsrsOptimizationApplied].model_validate(result)
 
@@ -1006,6 +1187,7 @@ def create_app(settings: Settings) -> ASGIApp:
         name="anki_fsrs_reschedule",
         scope="destructive",
         enabled=settings.allow_destructive,
+        destructive=True,
     )
     async def fsrs_reschedule(
         config_id: DeckPresetId,
@@ -1099,6 +1281,7 @@ def create_app(settings: Settings) -> ASGIApp:
         name="anki_decks_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
+        destructive=True,
     )
     async def decks_delete(
         deck_id: StableId,
@@ -1235,6 +1418,7 @@ def create_app(settings: Settings) -> ASGIApp:
         name="anki_notes_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
+        destructive=True,
     )
     async def notes_delete(
         note_ids: StableIds,
@@ -1294,6 +1478,7 @@ def create_app(settings: Settings) -> ASGIApp:
         name="anki_tags_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
+        destructive=True,
     )
     async def tags_delete(
         name: Tag,
@@ -1472,7 +1657,7 @@ def create_app(settings: Settings) -> ASGIApp:
             lambda adapter: adapter.set_card_flag(card_ids, flag),
         )
 
-    @scoped_tool(name="anki_cards_reposition", scope="admin")
+    @scoped_tool(name="anki_cards_reposition", scope="write")
     async def cards_reposition(
         card_ids: StableIds,
         starting_from: PositiveInt,
@@ -1533,6 +1718,7 @@ def create_app(settings: Settings) -> ASGIApp:
         name="anki_cards_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
+        destructive=True,
     )
     async def cards_delete(
         card_id: StableId,
@@ -1578,7 +1764,7 @@ def create_app(settings: Settings) -> ASGIApp:
     @scoped_tool(
         name="anki_note_types_change_preview",
         scope="admin",
-        enabled=settings.allow_schema_changes and settings.allow_full_sync,
+        enabled=settings.allow_schema_changes,
     )
     async def note_types_change_preview(
         operation: SchemaChangeOperation,
@@ -1596,7 +1782,6 @@ def create_app(settings: Settings) -> ASGIApp:
             "update": "anki_note_types_update",
             "fields_update": "anki_note_type_fields_update",
             "templates_update": "anki_templates_update",
-            "delete": "anki_note_types_delete",
         }
         template_values = (
             [template.model_dump() for template in templates] if templates is not None else None
@@ -1666,7 +1851,7 @@ def create_app(settings: Settings) -> ASGIApp:
                 "note_type_id": note_type_id,
                 "mappings": field_mapping_values,
             }
-        elif operation == "templates_update":
+        else:
             if (
                 note_type_id is None
                 or template_mapping_values is None
@@ -1684,30 +1869,21 @@ def create_app(settings: Settings) -> ASGIApp:
                 "note_type_id": note_type_id,
                 "mappings": template_mapping_values,
             }
-        else:
-            if (
-                note_type_id is None
-                or name is not None
-                or fields is not None
-                or template_values is not None
-                or field_mapping_values is not None
-                or template_mapping_values is not None
-                or css
-            ):
-                cause = ValueError("delete preview requires only note_type_id")
-                raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-            mutation_request = {"note_type_id": note_type_id}
         guard_request = {"operation": operation, "request": mutation_request}
         return await preview(
             operation_names[operation],
             guard_request,
-            lambda adapter: adapter.preview_note_type_change(operation, note_type_id),
+            lambda adapter: adapter.preview_note_type_change(
+                operation,
+                note_type_id,
+                [m["source_ordinal"] for m in mutation_request.get("mappings", [])] or None,
+            ),
         )
 
     @scoped_tool(
         name="anki_note_types_create",
         scope="admin",
-        enabled=settings.allow_schema_changes and settings.allow_full_sync,
+        enabled=settings.allow_schema_changes,
     )
     async def note_types_create(
         name: ResourceName,
@@ -1733,7 +1909,8 @@ def create_app(settings: Settings) -> ASGIApp:
     @scoped_tool(
         name="anki_note_types_update",
         scope="admin",
-        enabled=settings.allow_schema_changes and settings.allow_full_sync,
+        enabled=settings.allow_schema_changes,
+        destructive=True,
     )
     async def note_types_update(
         note_type_id: StableId,
@@ -1769,6 +1946,8 @@ def create_app(settings: Settings) -> ASGIApp:
         name="anki_note_type_fields_update",
         scope="admin",
         enabled=settings.allow_schema_changes and settings.allow_full_sync,
+        destructive=True,
+        sync="conditional",
     )
     async def note_type_fields_update(
         note_type_id: StableId,
@@ -1785,7 +1964,9 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             confirmation_token,
             {"operation": "fields_update", "request": request},
-            lambda adapter: adapter.preview_note_type_change("fields_update", note_type_id),
+            lambda adapter: adapter.preview_note_type_change(
+                "fields_update", note_type_id, [m["source_ordinal"] for m in mapping_values]
+            ),
             lambda adapter: adapter.update_note_type_fields(note_type_id, mapping_values),
         )
 
@@ -1793,6 +1974,8 @@ def create_app(settings: Settings) -> ASGIApp:
         name="anki_templates_update",
         scope="admin",
         enabled=settings.allow_schema_changes and settings.allow_full_sync,
+        destructive=True,
+        sync="conditional",
     )
     async def templates_update(
         note_type_id: StableId,
@@ -1809,34 +1992,10 @@ def create_app(settings: Settings) -> ASGIApp:
             request,
             confirmation_token,
             {"operation": "templates_update", "request": request},
-            lambda adapter: adapter.preview_note_type_change("templates_update", note_type_id),
+            lambda adapter: adapter.preview_note_type_change(
+                "templates_update", note_type_id, [m["source_ordinal"] for m in mapping_values]
+            ),
             lambda adapter: adapter.update_templates(note_type_id, mapping_values),
-        )
-
-    @scoped_tool(
-        name="anki_note_types_delete",
-        scope="destructive",
-        enabled=(
-            settings.allow_destructive
-            and settings.allow_schema_changes
-            and settings.allow_full_sync
-        ),
-    )
-    async def note_types_delete(
-        note_type_id: StableId,
-        confirmation_token: ConfirmationToken,
-        idempotency_key: IdempotencyKey | None = None,
-    ) -> dict[str, Any]:
-        """Delete a note type after preview, backup, and full-sync maintenance gating."""
-        request = {"note_type_id": note_type_id}
-        return await guarded_mutate(
-            "anki_note_types_delete",
-            idempotency_key,
-            request,
-            confirmation_token,
-            {"operation": "delete", "request": request},
-            lambda adapter: adapter.preview_note_type_change("delete", note_type_id),
-            lambda adapter: adapter.delete_note_type(note_type_id),
         )
 
     @scoped_tool(name="anki_media_list", scope="read")
@@ -1924,6 +2083,7 @@ def create_app(settings: Settings) -> ASGIApp:
         name="anki_media_delete",
         scope="destructive",
         enabled=settings.allow_destructive,
+        destructive=True,
     )
     async def media_delete(
         filename: MediaFilename,
@@ -2035,6 +2195,7 @@ def create_app(settings: Settings) -> ASGIApp:
     app = Starlette(routes=routes, middleware=mcp_app.user_middleware, lifespan=lifespan)
     app.state.settings = settings
     app.state.collection_service = service
+    app.state.mcp = mcp
     limited: ASGIApp = RequestBodyLimitMiddleware(
         app, settings.max_request_bytes, settings.mcp_path
     )

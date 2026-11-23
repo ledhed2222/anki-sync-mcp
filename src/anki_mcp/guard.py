@@ -14,6 +14,7 @@ class _Confirmation:
     operation: str
     request_hash: str
     expires_at: float
+    request: dict[str, Any]
 
 
 class ConfirmationRegistry:
@@ -54,8 +55,16 @@ class ConfirmationRegistry:
             operation=operation,
             request_hash=self._request_hash(operation, request),
             expires_at=now + self.ttl_seconds,
+            request=request,
         )
         return token
+
+    def describe(self, token: str) -> dict[str, Any] | None:
+        """Return the previewed request bound to a live token, for showing to a person."""
+        confirmation = self._tokens.get(token)
+        if confirmation is None or confirmation.expires_at <= self._clock():
+            return None
+        return confirmation.request
 
     def validate(self, token: str, operation: str, request: dict[str, Any]) -> None:
         """Validate a token without consuming it before pre-mutation safety gates."""

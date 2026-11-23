@@ -14,6 +14,8 @@ from anki_mcp.collection import AnkiCollectionService
 from anki_mcp.config import Settings
 from anki_mcp.guard import ConfirmationRegistry
 
+pytestmark = pytest.mark.usefixtures("person_approves")
+
 
 @pytest.fixture
 def phase3_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Settings]:
@@ -157,7 +159,10 @@ def test_schema_tools_require_full_sync_maintenance_and_preview(
             headers=headers,
             json={"jsonrpc": "2.0", "id": 99, "method": "tools/list", "params": {}},
         ).json()["result"]["tools"]
-        assert "anki_note_types_create" not in {tool["name"] for tool in listed}
+        names = {tool["name"] for tool in listed}
+        assert {"anki_note_types_create", "anki_note_types_update"} <= names
+        assert "anki_note_type_fields_update" not in names
+        assert "anki_templates_update" not in names
 
     with TestClient(create_app(phase3_settings)) as client:
         _, call = _session(client)
@@ -177,7 +182,7 @@ def test_schema_tools_require_full_sync_maintenance_and_preview(
             },
         )
         assert failed is False
-        assert preview["impact"]["full_sync_required"] is True
+        assert preview["impact"]["full_sync_required"] is False
         assert preview["impact"]["backup_required"] is True
 
         arguments: dict[str, object] = {
@@ -232,7 +237,7 @@ def test_schema_apply_accepts_explicit_current_backup(
         )
         assert failed is False
         assert preview["impact"]["backup_required"] is True
-        assert preview["impact"]["full_sync_required"] is True
+        assert preview["impact"]["full_sync_required"] is False
 
         failed, backup = call("anki_backup_create", {})
         assert failed is False

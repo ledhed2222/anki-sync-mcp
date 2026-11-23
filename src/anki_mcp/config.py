@@ -103,6 +103,9 @@ class Settings(BaseSettings):
     confirmation_ttl_seconds: int = Field(
         300, ge=30, le=3600, alias="ANKI_CONFIRMATION_TTL_SECONDS"
     )
+    confirmation_mode: Literal["token", "elicit", "elicit_required"] = Field(
+        "token", alias="ANKI_CONFIRMATION_MODE"
+    )
     bootstrap_mode: Literal["disabled", "download_if_empty"] = Field(
         "disabled", alias="ANKI_BOOTSTRAP_MODE"
     )
