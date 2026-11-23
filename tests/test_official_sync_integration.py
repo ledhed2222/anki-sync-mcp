@@ -174,3 +174,85 @@ def test_complete_phase1_lifecycle_against_official_sync_server(
         assert fields["Back"] == "second value"
 
     asyncio.run(verify_restart_and_second_client())
+
+
+def _seed_server_with_media(server_url: str, collection_path: str, file_count: int) -> None:
+    """Upload a collection holding many media files, using Anki's own client API directly."""
+    Path(collection_path).parent.mkdir(parents=True, exist_ok=True)
+    collection = Collection(collection_path)
+    try:
+        note = collection.new_note(collection.models.current())
+        note["Front"] = "media seed"
+        note["Back"] = "answer"
+        collection.add_note(note, collection.decks.id("Media Seed"))
+        for index in range(file_count):
+            collection.media.write_data(
+                f"seed-{index:05d}.txt", f"media file {index} ".encode() * 16
+            )
+        auth = collection.sync_login("phase1-user", "phase1-password", server_url)
+        output = collection.sync_collection(auth, sync_media=False)
+        assert output.required in {2, 4}, output.required
+        collection.full_upload_or_download(
+            auth=auth, server_usn=output.server_media_usn, upload=True
+        )
+        deadline = time.monotonic() + 120
+        while collection.media_sync_status().active:
+            assert time.monotonic() < deadline, "seeding media sync did not finish"
+            time.sleep(0.05)
+    finally:
+        collection.close()
+
+
+def test_large_media_sync_runs_in_background_and_status_stays_responsive(
+    official_sync_server: str, tmp_path: Path
+) -> None:
+    """A media sync far larger than any single request must finish without blocking callers."""
+    file_count = 1500
+    _seed_server_with_media(
+        official_sync_server, str(tmp_path / "seed" / "collection.anki2"), file_count
+    )
+    client_path = str(tmp_path / "client" / "collection.anki2")
+    Path(client_path).parent.mkdir()
+    Collection(client_path).close()
+
+    async def sync_from_empty_client() -> tuple[list[float], set[str], dict[str, object]]:
+        async with AnkiCollectionService(
+            client_path, max_page_size=100, media_sync_wait_seconds=0
+        ) as service:
+            await service.sync_login("phase1-user", "phase1-password", official_sync_server)
+            first = await service.sync(sync_media=True)
+            # The server has a collection this client lacks, so a full download comes first.
+            assert first["required"] == "FULL_DOWNLOAD"
+            assert first["media_sync"]["state"] == "not_started"
+            await service.full_sync(upload=False)
+
+            durations: list[float] = []
+            states: set[str] = set()
+            deadline = time.monotonic() + 120
+            while True:
+                began = time.monotonic()
+                status = await service.status()
+                durations.append(time.monotonic() - began)
+                states.add(status["media_sync"]["state"])
+                if status["media_sync"]["state"] != "in_progress":
+                    break
+                assert time.monotonic() < deadline, "media sync did not finish"
+                await asyncio.sleep(0.02)
+            return durations, states, status
+
+    durations, states, status = asyncio.run(sync_from_empty_client())
+
+    assert status["media_sync"]["state"] == "completed", status["media_sync"]
+    assert status["last_media_sync_at"]
+    assert status["media_sync"]["error"] is None
+    # status never waits on the transfer, however long the media sync runs.
+    assert max(durations) < 2, max(durations)
+    downloaded = {path.name for path in (Path(client_path).parent / "collection.media").iterdir()}
+    assert {f"seed-{index:05d}.txt" for index in range(file_count)} <= downloaded
+
+    async def sync_again() -> dict[str, object]:
+        async with AnkiCollectionService(client_path, max_page_size=100) as service:
+            return await service.sync(sync_media=True)
+
+    again = asyncio.run(sync_again())
+    assert again["media_sync"]["state"] == "completed"

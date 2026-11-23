@@ -529,7 +529,15 @@ async def test_sync_login_uses_configured_credentials_and_sync_reuses_host_key(
         "server_message_truncated": False,
         "host_number": 3,
         "media_sync_requested": True,
-        "media_sync": {"completed": True, "checked": "", "added": "", "removed": ""},
+        "media_sync": {
+            "state": "completed",
+            "completed": True,
+            "in_progress": False,
+            "error": None,
+            "checked": "",
+            "added": "",
+            "removed": "",
+        },
         "endpoint_changed": False,
     }
 

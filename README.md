@@ -123,7 +123,8 @@ internet-facing server exposes.
 | `ANKI_SYNC_HOST` | empty (AnkiWeb) | Custom sync-server HTTP(S) base URL. Non-loopback servers require HTTPS; credentials, query strings, and fragments are rejected. |
 | `ANKI_SYNC_ON_READ` | `false` | Synchronize before coordinated reads. Individual read tools can still request a sync with `sync_before=true`. |
 | `ANKI_SYNC_ON_WRITE` | `true` | Synchronize before and after coordinated mutations. Disabling this permits local changes to remain unsynchronized. |
-| `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Maximum wait for media synchronization (`> 0`, up to `3600` seconds). |
+| `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Seconds a background media sync may go without reporting progress before it is aborted (`> 0`, up to `3600`). A sync that keeps advancing is never cut off; an aborted one resumes from the files already transferred on the next sync. |
+| `ANKI_MEDIA_SYNC_WAIT_SECONDS` | `10` | How long `anki_sync` waits for media synchronization before returning `media_sync.state = "in_progress"` (`0`-`60` seconds; `0` returns immediately). Media sync continues in the background; follow it with `anki_status`. |
 | `ANKI_BOOTSTRAP_MODE` | `disabled` | Startup behavior: `disabled`, or `download_if_empty` to authenticate and perform a download-only initialization when the local collection is empty. A non-empty collection is left untouched and the server starts normally, so the setting can stay on across restarts. Startup fails rather than uploading if the server requests a full upload. |
 
 The persisted `anki_data` volume also contains synchronization authentication state, mutation

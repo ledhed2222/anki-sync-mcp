@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from anki.collection import Collection, ImportAnkiPackageRequest
+from anki.errors import NetworkError
 from anki.sync import SyncAuth, SyncOutput
 from anki.sync_pb2 import MediaSyncProgress, MediaSyncStatusResponse
 
@@ -340,7 +341,10 @@ async def test_media_sync_waits_for_completion_and_persists_progress(
         recovered = await restarted.status()
 
     assert synced["media_sync"] == {
+        "state": "completed",
         "completed": True,
+        "in_progress": False,
+        "error": None,
         "checked": "3",
         "added": "1",
         "removed": "1",
@@ -385,6 +389,234 @@ async def test_media_sync_timeout_preserves_persisted_sync_authentication(
     assert status["authenticated"] is True
     assert status["media_sync_progress"] == {"checked": "5", "added": "2", "removed": "1"}
     assert aborts == [True]
+
+
+def _patch_sync(monkeypatch: pytest.MonkeyPatch, required: int = 0) -> None:
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="phase2", endpoint=endpoint),
+    )
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=required),
+    )
+
+
+def _media_status(
+    active: bool, checked: str = "0", added: str = "0", removed: str = "0"
+) -> MediaSyncStatusResponse:
+    return MediaSyncStatusResponse(
+        active=active, progress=MediaSyncProgress(checked=checked, added=added, removed=removed)
+    )
+
+
+@pytest.mark.anyio
+async def test_media_sync_in_progress_is_returned_and_status_records_completion(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    statuses = iter(
+        [
+            _media_status(True, "10", "4"),
+            _media_status(True, "20", "9"),
+            _media_status(False, "30", "12"),
+        ]
+    )
+    _patch_sync(monkeypatch)
+    monkeypatch.setattr("anki._backend.RustBackend.media_sync_status", lambda self: next(statuses))
+    aborts: list[bool] = []
+    monkeypatch.setattr(Collection, "abort_media_sync", lambda self: aborts.append(True))
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, media_sync_wait_seconds=0
+    ) as service:
+        await service.sync_login("user", "password", None)
+        synced = await service.sync(sync_media=True)
+        running = await service.status()
+        finished = await service.status()
+        # Once finished the backend must not be polled again; the iterator is exhausted.
+        settled = await service.status()
+
+    async with AnkiCollectionService(phase2_collection, max_page_size=100) as restarted:
+        recovered = await restarted.status()
+
+    assert synced["media_sync"]["state"] == "in_progress"
+    assert synced["media_sync"]["completed"] is False
+    assert synced["media_sync"]["in_progress"] is True
+    assert running["media_sync"]["state"] == "in_progress"
+    assert running["last_media_sync_at"] is None
+    assert running["media_sync_progress"] == {"checked": "20", "added": "9", "removed": "0"}
+    assert finished["media_sync"]["state"] == "completed"
+    assert finished["media_sync"]["completed"] is True
+    assert finished["last_media_sync_at"]
+    assert finished["media_sync_progress"] == {"checked": "30", "added": "12", "removed": "0"}
+    assert settled["last_media_sync_at"] == finished["last_media_sync_at"]
+    assert recovered["last_media_sync_at"] == finished["last_media_sync_at"]
+    assert recovered["media_sync_progress"] == finished["media_sync_progress"]
+    assert recovered["media_sync"]["state"] == "idle"
+    assert aborts == []
+
+
+@pytest.mark.anyio
+async def test_media_sync_failure_is_recorded_once_by_status(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[int] = []
+
+    def media_status(self: object) -> MediaSyncStatusResponse:
+        calls.append(1)
+        if len(calls) == 1:
+            return _media_status(True, "5", "1")
+        # Anki raises a failed background media sync's error once, from the first status call.
+        raise NetworkError("media transfer failed", None, None, None)
+
+    _patch_sync(monkeypatch)
+    monkeypatch.setattr("anki._backend.RustBackend.media_sync_status", media_status)
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, media_sync_wait_seconds=0
+    ) as service:
+        await service.sync_login("user", "password", None)
+        synced = await service.sync(sync_media=True)
+        failed = await service.status()
+        later = await service.status()
+
+    assert synced["media_sync"]["state"] == "in_progress"
+    assert failed["media_sync"]["state"] == "failed"
+    assert failed["media_sync"]["error"] == "NETWORK_ERROR"
+    assert failed["media_sync"]["completed"] is False
+    assert failed["last_media_sync_at"] is None
+    assert failed["authenticated"] is True
+    assert later["media_sync"]["state"] == "failed"
+    assert len(calls) == 2
+
+
+@pytest.mark.anyio
+async def test_media_sync_is_not_started_when_full_sync_is_required(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def must_not_poll(self: object) -> MediaSyncStatusResponse:
+        raise AssertionError("no media sync was started")
+
+    _patch_sync(monkeypatch, required=2)
+    monkeypatch.setattr("anki._backend.RustBackend.media_sync_status", must_not_poll)
+
+    async with AnkiCollectionService(phase2_collection, max_page_size=100) as service:
+        await service.sync_login("user", "password", None)
+        synced = await service.sync(sync_media=True)
+        status = await service.status()
+
+    assert synced["required"] == "FULL_SYNC"
+    assert synced["media_sync"]["state"] == "not_started"
+    assert synced["media_sync"]["completed"] is False
+    assert status["last_media_sync_at"] is None
+    assert status["media_sync"]["state"] == "idle"
+
+
+@pytest.mark.anyio
+async def test_progressing_media_sync_is_not_aborted_by_the_stall_timeout(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    polls = iter(range(1, 10_000))
+    aborts: list[bool] = []
+    _patch_sync(monkeypatch)
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.media_sync_status",
+        lambda self: _media_status(True, str(next(polls))),
+    )
+    monkeypatch.setattr(Collection, "abort_media_sync", lambda self: aborts.append(True))
+
+    async with AnkiCollectionService(
+        phase2_collection,
+        max_page_size=100,
+        sync_timeout_seconds=0.05,
+        media_sync_wait_seconds=0.4,
+    ) as service:
+        await service.sync_login("user", "password", None)
+        synced = await service.sync(sync_media=True)
+
+    assert synced["media_sync"]["state"] == "in_progress"
+    assert aborts == []
+
+
+@pytest.mark.anyio
+async def test_stalled_media_sync_is_aborted_and_reported_failed_by_status(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    aborts: list[bool] = []
+    _patch_sync(monkeypatch)
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.media_sync_status",
+        lambda self: _media_status(True, "7", "3"),
+    )
+    monkeypatch.setattr(Collection, "abort_media_sync", lambda self: aborts.append(True))
+    monkeypatch.setattr("anki_mcp.collection.MEDIA_SYNC_ABORT_GRACE_SECONDS", 0.01)
+
+    async with AnkiCollectionService(
+        phase2_collection,
+        max_page_size=100,
+        sync_timeout_seconds=0.05,
+        media_sync_wait_seconds=0,
+    ) as service:
+        await service.sync_login("user", "password", None)
+        synced = await service.sync(sync_media=True)
+        time.sleep(0.1)
+        status = await service.status()
+
+    assert synced["media_sync"]["state"] == "in_progress"
+    assert status["media_sync"]["state"] == "failed"
+    assert status["media_sync"]["error"] == "STALLED"
+    assert status["last_media_sync_at"] is None
+    assert aborts == [True]
+
+
+@pytest.mark.anyio
+async def test_mutation_receipt_stays_retryable_until_media_sync_finishes(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media_active = {"value": True}
+    _patch_sync(monkeypatch)
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.media_sync_status",
+        lambda self: _media_status(media_active["value"], "4", "2"),
+    )
+    replayed = False
+
+    def must_not_replay(_: object) -> dict[str, object]:
+        nonlocal replayed
+        replayed = True
+        raise AssertionError("mutation replayed")
+
+    async with AnkiCollectionService(
+        phase2_collection,
+        max_page_size=100,
+        sync_on_write=True,
+        media_sync_wait_seconds=0,
+    ) as service:
+        await service.sync_login("user", "password", None)
+        first = await service.coordinated_mutation(
+            operation="anki_media_store",
+            idempotency_key="media-in-progress",
+            request={"filename": "slow.txt"},
+            mutate=lambda adapter: {"created": True},
+            sync_media=True,
+        )
+        media_active["value"] = False
+        retried = await service.coordinated_mutation(
+            operation="anki_media_store",
+            idempotency_key="media-in-progress",
+            request={"filename": "slow.txt"},
+            mutate=must_not_replay,
+            sync_media=True,
+        )
+
+    assert first["remote_synced"] is True
+    assert first["media_synced"] is False
+    assert first["retryable"] is True
+    assert retried["media_synced"] is True
+    assert retried["retryable"] is False
+    assert replayed is False
 
 
 @pytest.mark.anyio

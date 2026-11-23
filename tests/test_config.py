@@ -45,6 +45,7 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.max_card_fields == 100
     assert settings.max_media_bytes == 1_048_576
     assert settings.sync_timeout_seconds == 300
+    assert settings.media_sync_wait_seconds == 10
     assert settings.max_response_bytes == 1_048_576
     assert settings.max_request_bytes == 1_048_576
     assert settings.sync_username == "sync-user"
@@ -188,6 +189,16 @@ def test_limits_and_paths_are_validated(tmp_path: Path) -> None:
         Settings(_env_file=None, **env(tmp_path, ANKI_MAX_MEDIA_BYTES="0"))
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_TIMEOUT_SECONDS="0"))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **env(tmp_path, ANKI_MEDIA_SYNC_WAIT_SECONDS="-1"))
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **env(tmp_path, ANKI_MEDIA_SYNC_WAIT_SECONDS="61"))
+    assert (
+        Settings(
+            _env_file=None, **env(tmp_path, ANKI_MEDIA_SYNC_WAIT_SECONDS="0")
+        ).media_sync_wait_seconds
+        == 0
+    )
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **env(tmp_path, MCP_MAX_RESPONSE_BYTES="1023"))
     with pytest.raises(ValidationError):
