@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from anki.collection import Collection
@@ -167,6 +168,59 @@ async def test_batch_create_is_bounded_atomic_and_rejects_duplicates(collection_
         collection.close()
     assert len(created["notes"]) == 2
     assert all(item["card_ids"] for item in created["notes"])
+
+
+@pytest.mark.anyio
+async def test_batch_create_can_skip_duplicates(collection_path: str) -> None:
+    collection = Collection(collection_path)
+    try:
+        deck_id = int(collection.decks.id_for_name("Study") or 0)
+        model = collection.models.by_name("Basic")
+        assert model is not None
+        model_id = int(model["id"])
+        initial_count = collection.note_count()
+    finally:
+        collection.close()
+
+    def note(front: str) -> dict[str, Any]:
+        return {
+            "deck_id": deck_id,
+            "note_type_id": model_id,
+            "fields": {"Front": front, "Back": "x"},
+            "tags": [],
+        }
+
+    requests = [note("skip one"), note("existing"), note("skip two"), note("skip one")]
+    async with AnkiCollectionService(collection_path, max_page_size=100) as service:
+        with pytest.raises(DuplicateNoteError):
+            await service.create_notes_batch(requests)
+        result = await service.create_notes_batch(requests, skip_duplicates=True)
+        all_duplicates = await service.create_notes_batch([note("existing")], skip_duplicates=True)
+        with pytest.raises(LookupError):
+            await service.create_notes_batch(
+                [note("not created"), {**note("bad deck"), "deck_id": 999999}],
+                skip_duplicates=True,
+            )
+
+    assert [item["status"] for item in result["notes"]] == [
+        "created",
+        "duplicate",
+        "created",
+        "duplicate",
+    ]
+    assert all(result["notes"][i]["card_ids"] for i in (0, 2))
+    assert (result["created"], result["duplicates"]) == (2, 2)
+    assert all_duplicates == {
+        "notes": [{"status": "duplicate", "created": False}],
+        "created": 0,
+        "duplicates": 1,
+    }
+    collection = Collection(collection_path)
+    try:
+        assert collection.note_count() == initial_count + 2
+        assert not collection.find_notes('"not created"')
+    finally:
+        collection.close()
 
 
 @pytest.mark.anyio

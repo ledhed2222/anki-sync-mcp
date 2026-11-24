@@ -1804,38 +1804,60 @@ class CollectionAdapter:
             raise ValueError("note did not generate any cards")
         return {"note_id": int(note.id), "card_ids": card_ids, "created": True}
 
-    def create_notes_batch(self, requests: list[dict[str, Any]]) -> dict[str, Any]:
+    def create_notes_batch(
+        self, requests: list[dict[str, Any]], *, skip_duplicates: bool = False
+    ) -> dict[str, Any]:
         if not requests or len(requests) > self.max_batch_size:
             raise ValueError(f"batch must contain between 1 and {self.max_batch_size} notes")
-        prepared: list[tuple[Any, int]] = []
+        prepared: list[tuple[Any, int] | None] = []
         fingerprints: set[tuple[int, int]] = set()
         for request in requests:
-            note = self._prepare_note(
-                int(request["deck_id"]),
-                int(request["note_type_id"]),
-                dict(request["fields"]),
-                list(request.get("tags", [])),
-            )
-            fingerprint = (int(note.mid), field_checksum(note.fields[0]))
-            if fingerprint in fingerprints:
-                raise DuplicateNoteError("batch contains duplicate first fields")
+            try:
+                note = self._prepare_note(
+                    int(request["deck_id"]),
+                    int(request["note_type_id"]),
+                    dict(request["fields"]),
+                    list(request.get("tags", [])),
+                )
+                fingerprint = (int(note.mid), field_checksum(note.fields[0]))
+                if fingerprint in fingerprints:
+                    raise DuplicateNoteError("batch contains duplicate first fields")
+            except DuplicateNoteError:
+                if skip_duplicates:
+                    prepared.append(None)
+                    continue
+                raise
             fingerprints.add(fingerprint)
             prepared.append((note, int(request["deck_id"])))
-        self.collection.add_notes(
-            [
-                AddNoteRequest(note=note, deck_id=cast("DeckId", deck_id))
-                for note, deck_id in prepared
-            ]
-        )
-        results = []
-        for note, _ in prepared:
+        to_add = [item for item in prepared if item is not None]
+        if to_add:
+            self.collection.add_notes(
+                [
+                    AddNoteRequest(note=note, deck_id=cast("DeckId", deck_id))
+                    for note, deck_id in to_add
+                ]
+            )
+        results: list[dict[str, Any]] = []
+        for item in prepared:
+            if item is None:
+                results.append({"status": "duplicate", "created": False})
+                continue
+            note = item[0]
             card_ids = [
                 int(card_id) for card_id in self.collection.find_cards(f"nid:{int(note.id)}")
             ]
             if not card_ids:  # pragma: no cover - validated normal note types generate cards
                 raise RuntimeError("atomic note batch produced a note without cards")
-            results.append({"note_id": int(note.id), "card_ids": card_ids, "created": True})
-        return {"notes": results, "created": len(results)}
+            results.append(
+                {
+                    "status": "created",
+                    "note_id": int(note.id),
+                    "card_ids": card_ids,
+                    "created": True,
+                }
+            )
+        created = len(to_add)
+        return {"notes": results, "created": created, "duplicates": len(results) - created}
 
     def update_note_fields(self, note_id: int, fields: dict[str, str]) -> dict[str, Any]:
         if not fields:
@@ -3687,8 +3709,12 @@ class AnkiCollectionService:
             lambda adapter: adapter.create_note(deck_id, note_type_id, fields, tags)
         )
 
-    async def create_notes_batch(self, requests: list[dict[str, Any]]) -> dict[str, Any]:
-        return await self.executor.run(lambda adapter: adapter.create_notes_batch(requests))
+    async def create_notes_batch(
+        self, requests: list[dict[str, Any]], *, skip_duplicates: bool = False
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.create_notes_batch(requests, skip_duplicates=skip_duplicates)
+        )
 
     async def update_note_fields(self, note_id: int, fields: dict[str, str]) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.update_note_fields(note_id, fields))

@@ -326,8 +326,28 @@ def test_note_and_card_control_tools_return_durable_receipts(
             {"card_ids": [card_id], "idempotency_key": "protocol-unsuspend-key"},
         )
         fetched = call("anki_notes_get", {"note_id": note_id})
+        batch_args: dict[str, object] = {
+            "notes": [
+                {
+                    "deck_id": deck_id,
+                    "note_type_id": model_id,
+                    "fields": {"Front": front, "Back": "b"},
+                }
+                for front in ("batch a", "protocol", "batch b")
+            ],
+            "skip_duplicates": True,
+            "idempotency_key": "protocol-batch-key",
+        }
+        batch = call("anki_notes_create_batch", batch_args)
+        batch_replayed = call("anki_notes_create_batch", batch_args)
 
     assert repeated == created
+    assert batch_replayed == batch
+    assert [item["status"] for item in batch["result"]["notes"]] == [
+        "created",
+        "duplicate",
+        "created",
+    ]
     assert created["local_committed"] is True
     assert created["result"]["created"] is True
     assert changed["result"]["updated"] is True
