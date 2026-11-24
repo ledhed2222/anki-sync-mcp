@@ -1007,9 +1007,7 @@ class CollectionAdapter:
     def _bounded_preset_decks(self, config_id: int, operation: str) -> list[dict[str, Any]]:
         db = self.collection.db
         assert db is not None
-        rows = db.all(
-            "select id, name from decks order by id limit ?", self.max_search_scan + 1
-        )
+        rows = db.all("select id, name from decks order by id limit ?", self.max_search_scan + 1)
         if len(rows) > self.max_search_scan:
             raise ResourceLimitError(
                 f"FSRS {operation} for preset {config_id}: maximum={self.max_search_scan}, "
@@ -1176,9 +1174,7 @@ class CollectionAdapter:
         request = SimulateFsrsReviewRequest(
             params=self._active_fsrs_parameters(config, defaults),
             desired_retention=(
-                float(config.desired_retention)
-                if desired_retention is None
-                else desired_retention
+                float(config.desired_retention) if desired_retention is None else desired_retention
             ),
             deck_size=deck_size,
             days_to_simulate=days_to_simulate,
@@ -1256,9 +1252,7 @@ class CollectionAdapter:
         knowledge = [float(value) for value in response.accumulated_knowledge_acquisition]
         lengths = {len(daily_reviews), len(daily_new), len(daily_time), len(knowledge)}
         if lengths != {days_to_simulate}:
-            raise RuntimeError(
-                "Anki 26.5 FSRS simulator returned incompatible daily array lengths"
-            )
+            raise RuntimeError("Anki 26.5 FSRS simulator returned incompatible daily array lengths")
         result["summary"] = {
             "total_reviews": sum(daily_reviews),
             "total_new_cards": sum(daily_new),
@@ -1396,9 +1390,7 @@ class CollectionAdapter:
                 ):
                     valid_card_ids.add(int(row[0]))
                 review_history_hash.update(
-                    json.dumps(
-                        list(row), ensure_ascii=False, separators=(",", ":")
-                    ).encode("utf-8")
+                    json.dumps(list(row), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 )
                 review_history_hash.update(b"\n")
             last_review_id = int(review_rows[-1][1])
@@ -1488,9 +1480,7 @@ class CollectionAdapter:
         desired_retention: float | None,
         parameters: Sequence[float] | None,
     ) -> dict[str, Any]:
-        _, _, impact = self._fsrs_reschedule_impact(
-            config_id, desired_retention, parameters
-        )
+        _, _, impact = self._fsrs_reschedule_impact(config_id, desired_retention, parameters)
         return impact
 
     def reschedule_fsrs(
@@ -1530,6 +1520,7 @@ class CollectionAdapter:
         deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
         if deck is None:  # pragma: no cover - validated by _deck_config_state
             raise LookupError(f"deck {deck_id} not found")
+
         def resolved_layers(source_deck_id: int, source_state: Any) -> tuple[Any, Any, Any]:
             entry = next(
                 item
@@ -1587,9 +1578,7 @@ class CollectionAdapter:
         parent_chain = []
         for parent in parents:
             parent_id = int(parent["id"])
-            _, _, parent_effective = resolved_layers(
-                parent_id, self._deck_config_state(parent_id)
-            )
+            _, _, parent_effective = resolved_layers(parent_id, self._deck_config_state(parent_id))
             parent_chain.append(
                 {
                     "deck_id": parent_id,
@@ -2257,9 +2246,7 @@ class CollectionAdapter:
             "note_type_id": note_type_id,
             "affected_notes": note_count,
             "backup_required": True,
-            "full_sync_required": self._forces_full_sync(
-                operation, note_type_id, source_ordinals
-            ),
+            "full_sync_required": self._forces_full_sync(operation, note_type_id, source_ordinals),
             "state_fingerprint": self._impact_fingerprint(
                 {"models": models, "current_model": current_model}
             ),
@@ -2442,9 +2429,7 @@ class CollectionAdapter:
         card = self.collection.get_card(cast("CardId", card_id))
         return {"id": int(card.id), "note_id": int(card.nid), "deck_id": int(card.did)}
 
-    def get_card(
-        self, card_id: int, include_sections: Sequence[str] = ()
-    ) -> dict[str, Any]:
+    def get_card(self, card_id: int, include_sections: Sequence[str] = ()) -> dict[str, Any]:
         requested = set(include_sections)
         unknown = requested - {"review_summary", "fsrs"}
         if unknown:
@@ -2526,9 +2511,7 @@ class CollectionAdapter:
                     else None
                 ),
                 "retrievability": (
-                    float(stats.fsrs_retrievability)
-                    if stats.HasField("memory_state")
-                    else None
+                    float(stats.fsrs_retrievability) if stats.HasField("memory_state") else None
                 ),
                 "desired_retention": (
                     float(stats.desired_retention) if stats.HasField("memory_state") else None
@@ -2628,9 +2611,7 @@ class CollectionAdapter:
             result["review_kind"] = kinds[kind] if 0 <= kind < len(kinds) else "unknown"
         if "rating_label" in include_fields:
             result["rating_label"] = (
-                ("", "Again", "Hard", "Good", "Easy")[rating]
-                if 1 <= rating <= 4
-                else None
+                ("", "Again", "Hard", "Good", "Easy")[rating] if 1 <= rating <= 4 else None
             )
         if "intervals" in include_fields:
             result["interval_seconds"] = int(entry.interval)
@@ -2723,29 +2704,21 @@ class CollectionAdapter:
                 }
             )
 
-        period = {0: "all_time", 30: "one_month", 90: "three_months", 365: "one_year"}[
-            days
-        ]
+        period = {0: "all_time", 30: "one_month", 90: "three_months", 365: "one_year"}[days]
         button_period = graphs["buttons"][period]
         rating_counts = [
             sum(int(values[index]) for values in button_period.values()) for index in range(4)
         ]
         retained = sum(
-            int(value)
-            for category in ("young", "mature")
-            for value in button_period[category][1:]
+            int(value) for category in ("young", "mature") for value in button_period[category][1:]
         )
-        forgotten = sum(
-            int(button_period[category][0]) for category in ("young", "mature")
-        )
+        forgotten = sum(int(button_period[category][0]) for category in ("young", "mature"))
         retention_total = retained + forgotten
         total_seconds = total_millis / 1_000
         return {
             "reviews": total_reviews,
             "answer_seconds": total_seconds,
-            "average_answer_seconds": (
-                total_seconds / total_reviews if total_reviews else None
-            ),
+            "average_answer_seconds": (total_seconds / total_reviews if total_reviews else None),
             "retention": retained / retention_total if retention_total else None,
             "ratings": dict(zip(("again", "hard", "good", "easy"), rating_counts, strict=True)),
             "daily": daily,
@@ -2805,9 +2778,7 @@ class CollectionAdapter:
             "summary": self._review_summary(graph_data, days),
         }
         if requested_sections:
-            result["sections"] = {
-                section: graph_data[section] for section in requested_sections
-            }
+            result["sections"] = {section: graph_data[section] for section in requested_sections}
         return result
 
     def _basic_model(self) -> dict[str, Any]:
@@ -3783,7 +3754,6 @@ class AnkiCollectionService:
             lambda adapter: adapter.update_templates(note_type_id, mappings)
         )
 
-
     async def list_media(self, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.list_media(offset, limit))
 
@@ -3809,12 +3779,8 @@ class AnkiCollectionService:
     async def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.search_cards(query, offset, limit))
 
-    async def get_card(
-        self, card_id: int, include_sections: Sequence[str] = ()
-    ) -> dict[str, Any]:
-        return await self.executor.run(
-            lambda adapter: adapter.get_card(card_id, include_sections)
-        )
+    async def get_card(self, card_id: int, include_sections: Sequence[str] = ()) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.get_card(card_id, include_sections))
 
     async def list_reviews(
         self,

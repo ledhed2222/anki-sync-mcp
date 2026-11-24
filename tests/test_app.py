@@ -335,9 +335,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     simulation_result = simulation_output["properties"]["result"]
     assert simulation_result["discriminator"]["propertyName"] == "mode"
     assert (
-        by_name["anki_fsrs_reschedule"]["inputSchema"]["properties"]["confirmation_token"][
-            "type"
-        ]
+        by_name["anki_fsrs_reschedule"]["inputSchema"]["properties"]["confirmation_token"]["type"]
         == "string"
     )
     preset_get = by_name["anki_deck_presets_get"]["inputSchema"]["properties"]
@@ -994,7 +992,8 @@ def test_fsrs_tools_work_through_json_rpc(
     assert rescheduled["result"]["backup"]["path"]
 
     spanish_deck = next(
-        deck for deck in call("anki_decks_list", {"offset": 0, "limit": 20})["items"]
+        deck
+        for deck in call("anki_decks_list", {"offset": 0, "limit": 20})["items"]
         if deck["name"] == "Languages::Spanish"
     )
     stale_preview = call(
@@ -1002,9 +1001,7 @@ def test_fsrs_tools_work_through_json_rpc(
     )
 
     def sync_changes_fsrs_state(adapter: CollectionAdapter) -> None:
-        adapter.update_deck_limits(
-            spanish_deck["id"], "this_deck", {"desired_retention": 0.88}, ()
-        )
+        adapter.update_deck_limits(spanish_deck["id"], "this_deck", {"desired_retention": 0.88}, ())
 
     service = client.app.app.state.collection_service
     service.executor.submit(lambda adapter: setattr(adapter, "sync_on_write", True)).result()
@@ -1030,9 +1027,7 @@ def test_fsrs_tools_work_through_json_rpc(
         assert recorded is not None
         operation, request_hash, receipt = recorded
         receipt["remote_synced"] = False
-        adapter._state.put_receipt(
-            "optimize-default-preset", operation, request_hash, receipt
-        )
+        adapter._state.put_receipt("optimize-default-preset", operation, request_hash, receipt)
         adapter._state.mark_pending_discarded_by_full_download()
 
     service.executor.submit(discard_pending_optimization).result()
@@ -1896,9 +1891,7 @@ def test_tool_errors_are_machine_readable(
         CollectionAdapter,
         "preview_fsrs_reschedule",
         lambda self, config_id, desired_retention, parameters: (_ for _ in ()).throw(
-            ResourceLimitError(
-                "FSRS reschedule: maximum=1, observed_at_least=2; split scope"
-            )
+            ResourceLimitError("FSRS reschedule: maximum=1, observed_at_least=2; split scope")
         ),
     )
     limited = error_for(
