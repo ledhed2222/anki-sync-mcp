@@ -3292,8 +3292,9 @@ class CollectionAdapter:
             }
             if progress != self._media_sync_progress:
                 self._media_sync_progress = progress
-                self._media_progress_changed_at = time.monotonic()
                 self._save_operational_status()
+                # Stamped after the fsync above, so a slow disk never counts as a stalled sync.
+                self._media_progress_changed_at = time.monotonic()
                 MEDIA_SYNC_LOGGER.debug(
                     "media sync progress checked=%s added=%s removed=%s active=%s elapsed=%.1fs",
                     progress["checked"],
