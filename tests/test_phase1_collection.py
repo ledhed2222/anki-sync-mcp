@@ -178,6 +178,7 @@ async def test_batch_create_can_skip_duplicates(collection_path: str) -> None:
         model = collection.models.by_name("Basic")
         assert model is not None
         model_id = int(model["id"])
+        existing_id = int(collection.find_notes('"existing"')[0])
         initial_count = collection.note_count()
     finally:
         collection.close()
@@ -209,9 +210,11 @@ async def test_batch_create_can_skip_duplicates(collection_path: str) -> None:
         "duplicate",
     ]
     assert all(result["notes"][i]["card_ids"] for i in (0, 2))
+    assert result["notes"][1]["duplicate_of"] == existing_id
+    assert result["notes"][3]["duplicate_of"] == result["notes"][0]["note_id"]
     assert (result["created"], result["duplicates"]) == (2, 2)
     assert all_duplicates == {
-        "notes": [{"status": "duplicate", "created": False}],
+        "notes": [{"status": "duplicate", "duplicate_of": existing_id, "created": False}],
         "created": 0,
         "duplicates": 1,
     }

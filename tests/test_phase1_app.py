@@ -348,6 +348,7 @@ def test_note_and_card_control_tools_return_durable_receipts(
         "duplicate",
         "created",
     ]
+    assert batch["result"]["notes"][1]["duplicate_of"] == note_id
     assert created["local_committed"] is True
     assert created["result"]["created"] is True
     assert changed["result"]["updated"] is True

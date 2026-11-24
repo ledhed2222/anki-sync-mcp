@@ -1364,7 +1364,8 @@ def create_app(settings: Settings) -> ASGIApp:
 
         With skip_duplicates, notes whose first field duplicates an existing note (or an
         earlier note in the batch) are skipped instead of failing the batch; each result in
-        request order has status "created" (with note_id and card_ids) or "duplicate".
+        request order has status "created" (with note_id and card_ids) or "duplicate" (with
+        duplicate_of, the id of the note it duplicates).
         Any other error still fails the whole batch.
         """
         if not notes or len(notes) > settings.max_batch_size:
