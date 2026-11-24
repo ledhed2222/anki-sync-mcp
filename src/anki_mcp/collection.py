@@ -1699,7 +1699,9 @@ class CollectionAdapter:
             ),
         }
 
-    def search_notes(self, query: str, offset: int, limit: int) -> dict[str, Any]:
+    def search_notes(
+        self, query: str, offset: int, limit: int, include_fields: bool = False
+    ) -> dict[str, Any]:
         self._page([], offset, limit)
         if int(self.collection.note_count()) > self.max_search_scan:
             raise ValueError(
@@ -1707,7 +1709,8 @@ class CollectionAdapter:
             )
         note_ids = [int(note_id) for note_id in self.collection.find_notes(query)]
         result = self._page(note_ids, offset, limit)
-        result["items"] = [self._note_summary(note_id) for note_id in result["items"]]
+        render = self.get_note if include_fields else self._note_summary
+        result["items"] = [render(note_id) for note_id in result["items"]]
         return result
 
     def _note_summary(self, note_id: int) -> dict[str, Any]:
@@ -3721,8 +3724,12 @@ class AnkiCollectionService:
     async def delete_deck(self, deck_id: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.delete_deck(deck_id))
 
-    async def search_notes(self, query: str, offset: int, limit: int) -> dict[str, Any]:
-        return await self.executor.run(lambda adapter: adapter.search_notes(query, offset, limit))
+    async def search_notes(
+        self, query: str, offset: int, limit: int, include_fields: bool = False
+    ) -> dict[str, Any]:
+        return await self.executor.run(
+            lambda adapter: adapter.search_notes(query, offset, limit, include_fields)
+        )
 
     async def get_note(self, note_id: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.get_note(note_id))

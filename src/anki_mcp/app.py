@@ -1316,12 +1316,17 @@ def create_app(settings: Settings) -> ASGIApp:
         query: SearchQuery = "",
         offset: Offset = 0,
         limit: PageLimit = settings.max_page_size,
+        include_fields: StrictBool = False,
         sync_before: SyncMedia = False,
     ) -> dict[str, Any]:
-        """Search notes with Anki search syntax and bounded offset pagination."""
+        """Search notes with Anki search syntax and bounded offset pagination.
+
+        With include_fields, each item is the full note as anki_notes_get returns it.
+        """
         return await execute(
             service.coordinated_read(
-                lambda adapter: adapter.search_notes(query, offset, limit), sync_before
+                lambda adapter: adapter.search_notes(query, offset, limit, include_fields),
+                sync_before,
             )
         )
 
