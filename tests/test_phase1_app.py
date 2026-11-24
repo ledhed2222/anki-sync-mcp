@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 from anki.collection import Collection
 from anki.sync import SyncAuth, SyncOutput
-from pydantic import SecretStr
+from conftest import owner_collection_path, owner_service, use_owner
 from starlette.testclient import TestClient
 
 from anki_mcp.app import create_app
@@ -16,17 +16,13 @@ from anki_mcp.config import Settings
 
 @pytest.fixture
 def phase_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
-    collection_path = tmp_path / "collection.anki2"
+    collection_path = owner_collection_path(tmp_path)
     collection = Collection(str(collection_path))
     try:
         collection.decks.id("Study")
     finally:
         collection.close()
-    monkeypatch.setenv("MCP_AUTH_TOKEN", "phase-token")
-    monkeypatch.setenv("ANKI_COLLECTION_PATH", str(collection_path))
-    monkeypatch.setenv("ANKI_SYNC_USERNAME", "")
-    monkeypatch.delenv("ANKI_SYNC_PASSWORD", raising=False)
-    monkeypatch.setenv("ANKI_SYNC_HOST", "https://sync.example.test/")
+    use_owner(monkeypatch, tmp_path, "phase-token", sync_endpoint="https://sync.example.test/")
     monkeypatch.setenv("ANKI_SYNC_ON_WRITE", "false")
     return Settings(_env_file=None)
 
@@ -222,7 +218,7 @@ def test_scope_and_safety_flags_control_tool_discovery(phase_settings: Settings)
 def test_note_and_card_control_tools_return_durable_receipts(
     phase_settings: Settings,
 ) -> None:
-    collection = Collection(str(phase_settings.collection_path))
+    collection = Collection(str(phase_settings.user_collection_path("owner")))
     try:
         deck_id = int(collection.decks.id_for_name("Study") or 0)
         target_id = int(collection.decks.id("Target"))
@@ -364,7 +360,7 @@ def test_note_and_card_control_tools_return_durable_receipts(
 def test_notes_search_returns_fewer_items_to_fit_the_response_limit(
     phase_settings: Settings,
 ) -> None:
-    collection = Collection(str(phase_settings.collection_path))
+    collection = Collection(str(phase_settings.user_collection_path("owner")))
     try:
         deck_id = collection.decks.id_for_name("Study")
         model = collection.models.by_name("Basic")
@@ -425,13 +421,6 @@ def test_notes_search_returns_fewer_items_to_fit_the_response_limit(
 
 def test_status_backup_and_readiness_are_actionable(phase_settings: Settings) -> None:
     with TestClient(create_app(phase_settings)) as client:
-        readiness = client.get("/health/ready")
-        assert readiness.status_code == 503
-        assert readiness.json() == {
-            "status": "not_ready",
-            "reason": "authentication_required",
-        }
-
         headers = {
             "Authorization": "Bearer phase-token",
             "Accept": "application/json, text/event-stream",
@@ -475,7 +464,7 @@ def test_status_backup_and_readiness_are_actionable(phase_settings: Settings) ->
     assert backup["requested"] is True
 
 
-def test_download_if_empty_bootstrap_runs_during_application_startup(
+def test_download_if_empty_bootstrap_runs_when_a_collection_first_opens(
     phase_settings: Settings, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     full_sync_directions: list[bool] = []
@@ -497,17 +486,15 @@ def test_download_if_empty_bootstrap_runs_during_application_startup(
         "full_upload_or_download",
         lambda self, *, auth, server_usn, upload: full_sync_directions.append(upload),
     )
-    bootstrap_settings = phase_settings.model_copy(
-        update={
-            "bootstrap_mode": "download_if_empty",
-            "sync_username": "bootstrap-user",
-            "sync_password": SecretStr("bootstrap-password"),
-        }
+    users = json.loads(phase_settings.users_file.read_text())
+    users["users"]["owner"].update(
+        sync_username="bootstrap-user", sync_password="bootstrap-password"
     )
+    phase_settings.users_file.write_text(json.dumps(users))
+    bootstrap_settings = phase_settings.model_copy(update={"bootstrap_mode": "download_if_empty"})
 
     with TestClient(create_app(bootstrap_settings)) as client:
-        readiness = client.get("/health/ready")
+        assert full_sync_directions == []
+        owner_service(client)
 
-    assert readiness.status_code == 200
-    assert readiness.json() == {"status": "ready"}
     assert full_sync_directions == [False]

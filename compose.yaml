@@ -7,11 +7,9 @@ services:
     environment:
       MCP_HOST: "0.0.0.0"
       MCP_PORT: "8000"
-      MCP_AUTH_TOKEN_FILE: "/run/secrets/anki_mcp_token"
-      ANKI_COLLECTION_PATH: "/data/collection.anki2"
-      ANKI_SYNC_USERNAME: "${ANKI_SYNC_USERNAME:-}"
-      ANKI_SYNC_PASSWORD_FILE: "/run/secrets/anki_sync_password"
-      ANKI_SYNC_HOST: "${ANKI_SYNC_HOST:-}"
+      MCP_PUBLIC_URL: "${MCP_PUBLIC_URL:?set MCP_PUBLIC_URL to the server's public HTTPS origin}"
+      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-localhost,localhost:*,127.0.0.1,127.0.0.1:*,anki-mcp,anki-mcp:*}"
+      ANKI_DATA_DIR: "/data"
       MCP_SCOPES: "${MCP_SCOPES:-read,write,admin}"
       ANKI_SYNC_ON_READ: "${ANKI_SYNC_ON_READ:-false}"
       ANKI_SYNC_ON_WRITE: "${ANKI_SYNC_ON_WRITE:-true}"
@@ -27,9 +25,6 @@ services:
       MCP_MAX_CARD_FIELDS: "100"
       MCP_MAX_RESPONSE_BYTES: "1048576"
       MCP_MAX_REQUEST_BYTES: "1048576"
-    secrets:
-      - anki_mcp_token
-      - anki_sync_password
     volumes:
       - anki_data:/data
     networks:
@@ -37,12 +32,6 @@ services:
       - egress
     expose:
       - "8000"
-
-secrets:
-  anki_mcp_token:
-    file: ./secrets/anki_mcp_token
-  anki_sync_password:
-    file: ./secrets/anki_sync_password
 
 volumes:
   anki_data:

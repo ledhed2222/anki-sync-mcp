@@ -11,7 +11,8 @@ from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from pydantic import ValidationError
+from conftest import OWNER_PASSWORD as PASSWORD
+from conftest import sign_in_users
 from starlette.testclient import TestClient
 
 from anki_mcp import oauth, users
@@ -21,7 +22,6 @@ from anki_mcp.config import Settings
 from anki_mcp.users import CollectionRegistry
 
 REDIRECT = "https://claude.ai/api/mcp/auth_callback"
-PASSWORD = "correct horse battery"
 
 
 class _FakeService:
@@ -151,20 +151,14 @@ def test_failed_open_releases_its_slot() -> None:
     asyncio.run(scenario())
 
 
-def _add_user(users_file: Path, user_id: str, capsys: pytest.CaptureFixture[str]) -> str:
-    users.main(["--file", str(users_file), "add", user_id, "--no-login-password"])
-    return capsys.readouterr().out.strip()
-
-
 @pytest.fixture
 def users_file(tmp_path: Path) -> Path:
-    return tmp_path / "users.json"
+    return tmp_path / "data" / "users.json"
 
 
 @pytest.fixture
-def multi_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, users_file: Path) -> Settings:
-    monkeypatch.setenv("ANKI_COLLECTION_PATH", str(tmp_path / "data" / "collection.anki2"))
-    monkeypatch.setenv("MCP_USERS_FILE", str(users_file))
+def multi_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Settings:
+    sign_in_users(monkeypatch, tmp_path / "data", {"alice": "alice-token", "bob": "bob-token"})
     monkeypatch.setenv("ANKI_SYNC_ON_WRITE", "false")
     monkeypatch.setenv("ANKI_INITIAL_MEDIA_SYNC", "false")
     monkeypatch.setenv("ANKI_MEDIA_ROOT", str(tmp_path / "hdd" / "media"))
@@ -224,12 +218,10 @@ def _deck_names(session: _Session) -> set[str]:
 
 
 def test_each_user_sees_only_their_own_collection(
-    multi_settings: Settings, users_file: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    multi_settings: Settings, users_file: Path, tmp_path: Path
 ) -> None:
-    alice_token = _add_user(users_file, "alice", capsys)
-    bob_token = _add_user(users_file, "bob", capsys)
     with TestClient(create_app(multi_settings)) as client:
-        alice, bob = _Session(client, alice_token), _Session(client, bob_token)
+        alice, bob = _Session(client, "alice-token"), _Session(client, "bob-token")
         alice.call("anki_decks_create", {"name": "Alice only"})
         bob.call("anki_decks_create", {"name": "Bob only"})
         assert "Alice only" in _deck_names(alice)
@@ -263,29 +255,8 @@ def test_each_user_sees_only_their_own_collection(
 
         assert _Session(client, "not-a-token").status_code == 401
         users.main(["--file", str(users_file), "remove", "bob"])
-        assert _Session(client, bob_token).status_code == 401
+        assert _Session(client, "bob-token").status_code == 401
     assert (tmp_path / "data" / "users" / "bob" / "collection.anki2").exists()
-
-
-def test_multi_user_refuses_an_existing_single_user_collection(
-    multi_settings: Settings, users_file: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    _add_user(users_file, "alice", capsys)
-    multi_settings.collection_path.parent.mkdir(parents=True)
-    multi_settings.collection_path.write_bytes(b"")
-    with (
-        pytest.raises(RuntimeError, match="single-user collection"),
-        TestClient(create_app(multi_settings)),
-    ):
-        pass
-
-
-def test_users_file_rejects_shared_sync_settings(
-    multi_settings: Settings, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setenv("ANKI_SYNC_USERNAME", "shared")
-    with pytest.raises(ValidationError, match="ANKI_SYNC_USERNAME"):
-        Settings(_env_file=None)
 
 
 def test_users_file_rejects_unsafe_user_ids(tmp_path: Path) -> None:
@@ -294,7 +265,28 @@ def test_users_file_rejects_unsafe_user_ids(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="invalid user id"):
         users.UserStore(path)
     with pytest.raises(SystemExit):
-        users.main(["--file", str(path.with_name("new.json")), "add", "Bad/Id"])
+        users.main(["--file", str(path.with_name("new.json")), "add", "Bad/Id", "--hash", "x"])
+
+
+def test_user_command_manages_accounts(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    path = tmp_path / "users.json"
+    first, second = oauth.hash_password("first password"), oauth.hash_password("second pass")
+    users.main(["--file", str(path), "add", "alice", "--hash", first, "--sync-username", "a"])
+    users.main(["--file", str(path), "add", "bob", "--hash", first])
+    with pytest.raises(SystemExit):
+        users.main(["--file", str(path), "add", "alice", "--hash", first])
+    with pytest.raises(SystemExit):
+        users.main(["--file", str(path), "passwd", "alice", "--hash", "not-a-hash"])
+    users.main(["--file", str(path), "passwd", "alice", "--hash", second])
+    users.main(["--file", str(path), "remove", "bob"])
+    capsys.readouterr()
+    users.main(["--file", str(path), "list"])
+    assert capsys.readouterr().out.split() == ["alice"]
+    alice = users.UserStore(path).get("alice")
+    assert alice is not None
+    assert alice.password_hash == second
+    assert alice.sync_username == "a"
+    assert path.stat().st_mode & 0o077 == 0
 
 
 def test_media_link_never_replaces_an_existing_folder(tmp_path: Path) -> None:
@@ -353,10 +345,6 @@ def oauth_client(
     multi_settings: Settings, users_file: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[TestClient]:
     monkeypatch.setattr(oauth, "_FAILED_LOGIN_DELAY_SECONDS", 0)
-    entry = {"password_hash": oauth.hash_password(PASSWORD)}
-    users_file.write_text(json.dumps({"users": {"alice": entry, "bob": dict(entry)}}))
-    monkeypatch.setenv("MCP_AUTH_MODE", "builtin")
-    monkeypatch.setenv("MCP_PUBLIC_URL", "http://localhost")
     with TestClient(create_app(Settings(_env_file=None)), follow_redirects=False) as client:
         yield client
 

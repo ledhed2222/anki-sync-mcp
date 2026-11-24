@@ -6,17 +6,11 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from anki_mcp.config import Settings, validate_sync_migration_endpoint
+from anki_mcp.config import Settings, validate_sync_endpoint, validate_sync_migration_endpoint
 
 
 def env(tmp_path: Path, **values: str) -> dict[str, str]:
-    base = {
-        "MCP_AUTH_TOKEN": "test-secret",
-        "ANKI_COLLECTION_PATH": str(tmp_path / "c.anki2"),
-        "ANKI_SYNC_USERNAME": "sync-user",
-        "ANKI_SYNC_PASSWORD": "sync-password",
-        "ANKI_SYNC_HOST": "https://sync.example.test/",
-    }
+    base = {"ANKI_DATA_DIR": str(tmp_path), "MCP_PUBLIC_URL": "http://localhost"}
     base.update(values)
     return base
 
@@ -33,9 +27,11 @@ def test_readme_documents_every_environment_setting() -> None:
     assert documented == configured
 
 
-def test_direct_token_and_defaults(tmp_path: Path) -> None:
+def test_defaults(tmp_path: Path) -> None:
     settings = Settings(_env_file=None, **env(tmp_path))
-    assert settings.auth_token.get_secret_value() == "test-secret"
+    assert settings.users_file == tmp_path / "users.json"
+    assert settings.user_collection_path("alice") == tmp_path / "users/alice/collection.anki2"
+    assert settings.max_open_collections == 100
     assert settings.host == "0.0.0.0"
     assert settings.port == 8000
     assert settings.mcp_path == "/mcp"
@@ -50,9 +46,6 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.media_sync_wait_seconds == 10
     assert settings.max_response_bytes == 1_048_576
     assert settings.max_request_bytes == 1_048_576
-    assert settings.sync_username == "sync-user"
-    assert settings.sync_password.get_secret_value() == "sync-password"
-    assert settings.sync_host == "https://sync.example.test/"
     assert settings.scopes == frozenset({"read", "write", "admin"})
     assert settings.sync_on_read is False
     assert settings.sync_on_write is True
@@ -61,44 +54,6 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.allow_schema_changes is False
     assert settings.bootstrap_mode == "disabled"
     assert settings.max_batch_size == 50
-
-
-def test_sync_username_can_be_empty_until_login(tmp_path: Path) -> None:
-    settings = Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_USERNAME=""))
-
-    assert settings.sync_username == ""
-
-
-def test_sync_password_can_be_omitted_for_persisted_auth(tmp_path: Path) -> None:
-    values = env(tmp_path)
-    del values["ANKI_SYNC_PASSWORD"]
-    assert Settings(_env_file=None, **values).sync_password is None
-
-
-def test_sync_password_can_be_loaded_from_secret_file(tmp_path: Path) -> None:
-    secret = tmp_path / "sync-password"
-    secret.write_text("file-sync-password\n", encoding="utf-8")
-    values = env(tmp_path, ANKI_SYNC_PASSWORD_FILE=str(secret))
-    del values["ANKI_SYNC_PASSWORD"]
-
-    settings = Settings(_env_file=None, **values)
-
-    assert settings.sync_password.get_secret_value() == "file-sync-password"
-
-
-def test_exactly_one_sync_password_source_is_required(tmp_path: Path) -> None:
-    secret = tmp_path / "sync-password"
-    secret.write_text("file-sync-password", encoding="utf-8")
-    with pytest.raises(ValidationError, match="exactly one"):
-        Settings(
-            _env_file=None,
-            **env(tmp_path, ANKI_SYNC_PASSWORD_FILE=str(secret)),
-        )
-
-
-def test_empty_sync_host_selects_ankiweb(tmp_path: Path) -> None:
-    settings = Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=""))
-    assert settings.sync_endpoint is None
 
 
 @pytest.mark.parametrize(
@@ -118,16 +73,16 @@ def test_empty_sync_host_selects_ankiweb(tmp_path: Path) -> None:
         "https://sync example.test/",
     ],
 )
-def test_sync_host_rejects_insecure_or_credential_bearing_urls(tmp_path: Path, host: str) -> None:
-    with pytest.raises(ValidationError, match="ANKI_SYNC_HOST"):
-        Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=host))
+def test_sync_endpoint_rejects_insecure_or_credential_bearing_urls(host: str) -> None:
+    with pytest.raises(ValueError, match="sync endpoint"):
+        validate_sync_endpoint(host)
 
 
 @pytest.mark.parametrize(
     "host", ["http://localhost:8080", "http://127.0.0.1:8080", "http://[::1]:8080"]
 )
-def test_sync_host_allows_http_only_for_loopback_development(tmp_path: Path, host: str) -> None:
-    assert Settings(_env_file=None, **env(tmp_path, ANKI_SYNC_HOST=host)).sync_host == host
+def test_sync_endpoint_allows_http_only_for_loopback_development(host: str) -> None:
+    assert validate_sync_endpoint(host) == host
 
 
 def test_sync_migrations_remain_within_the_login_trust_boundary() -> None:
@@ -147,39 +102,6 @@ def test_sync_migrations_remain_within_the_login_trust_boundary() -> None:
         )
     with pytest.raises(ValueError, match="untrusted origin"):
         validate_sync_migration_endpoint("https://127.0.0.1/", None)
-
-
-def test_token_file_strips_one_trailing_newline(tmp_path: Path) -> None:
-    secret = tmp_path / "token"
-    secret.write_text("file-secret\n", encoding="utf-8")
-    values = env(tmp_path, MCP_AUTH_TOKEN_FILE=str(secret))
-    del values["MCP_AUTH_TOKEN"]
-    assert Settings(_env_file=None, **values).auth_token.get_secret_value() == "file-secret"
-
-
-@pytest.mark.parametrize(
-    "changes",
-    [{}, {"MCP_AUTH_TOKEN": "x", "MCP_AUTH_TOKEN_FILE": "/tmp/token"}],
-)
-def test_exactly_one_token_source_is_required(tmp_path: Path, changes: dict[str, str]) -> None:
-    values = {"ANKI_COLLECTION_PATH": str(tmp_path / "c.anki2"), **changes}
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, **values)
-
-
-def test_empty_direct_token_still_conflicts_with_token_file(tmp_path: Path) -> None:
-    secret = tmp_path / "credential"
-    secret.write_text("file-secret", encoding="utf-8")
-    values = env(tmp_path)
-    values["MCP_AUTH_TOKEN"] = ""
-    values["MCP_AUTH_TOKEN_FILE"] = str(secret)
-    with pytest.raises(ValidationError, match="exactly one"):
-        Settings(_env_file=None, **values)
-
-
-def test_missing_or_empty_token_file_fails(tmp_path: Path) -> None:
-    with pytest.raises(ValidationError):
-        Settings(_env_file=None, **env(tmp_path, MCP_AUTH_TOKEN=""))
 
 
 def test_limits_and_paths_are_validated(tmp_path: Path) -> None:

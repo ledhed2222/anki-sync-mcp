@@ -1,7 +1,7 @@
-"""Multi-user accounts: the users file, its admin command, and the per-user collection registry.
+"""Accounts: the users file, its admin command, and the per-user collection registry.
 
-Multi-user mode is on when MCP_USERS_FILE is set. Each user gets their own collection under
-<ANKI_COLLECTION_PATH's directory>/users/<id>/, opened on first use and closed when idle.
+Every user has their own collection at <ANKI_DATA_DIR>/users/<id>/collection.anki2, opened on
+first use and closed when idle. A personal install is simply one with a single user.
 """
 
 from __future__ import annotations
@@ -9,11 +9,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
-import hashlib
-import hmac
 import logging
+import os
 import re
-import secrets
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -28,21 +26,17 @@ from anki_mcp.state import PersistentState
 
 _LOGGER = logging.getLogger(__name__)
 _USER_ID = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
+OWNER = "owner"
 
 
 def valid_user_id(user_id: str) -> bool:
     return _USER_ID.fullmatch(user_id) is not None
 
 
-def token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
 @dataclass(frozen=True)
 class User:
     id: str
     password_hash: str | None
-    token_sha256: str | None
     sync_username: str
     sync_password: str | None
     sync_endpoint: str | None
@@ -62,7 +56,6 @@ def _parse_users(raw: dict[str, Any]) -> dict[str, User]:
         users[user_id] = User(
             id=user_id,
             password_hash=entry.get("password_hash") or None,
-            token_sha256=entry.get("token_sha256") or None,
             sync_username=str(entry.get("sync_username") or ""),
             sync_password=entry.get("sync_password") or None,
             sync_endpoint=endpoint or None,
@@ -92,16 +85,6 @@ class UserStore:
     def get(self, user_id: str) -> User | None:
         self._reload()
         return self._users.get(user_id)
-
-    def by_token(self, token: str) -> User | None:
-        self._reload()
-        supplied = token_hash(token)
-        match = None
-        for user in self._users.values():
-            # Compare against every user so timing does not reveal which entry matched.
-            if user.token_sha256 is not None and hmac.compare_digest(supplied, user.token_sha256):
-                match = user
-        return match
 
 
 @dataclass
@@ -229,12 +212,12 @@ class CollectionRegistry:
                     await service.__aexit__()
 
 
-def _load_raw(path: Path) -> dict[str, Any]:
+def load_users_file(path: Path) -> dict[str, Any]:
     raw = PersistentState._load_json(path) if path.exists() else None
     return raw or {"users": {}}
 
 
-def _save_raw(path: Path, raw: dict[str, Any]) -> None:
+def save_users_file(path: Path, raw: dict[str, Any]) -> None:
     _parse_users(raw)
     path.parent.mkdir(parents=True, exist_ok=True)
     PersistentState._atomic_json(path, raw, secret=True)
@@ -249,28 +232,41 @@ def _prompt_password(prompt: str, minimum: int) -> str:
     return password
 
 
-def main(argv: list[str] | None = None) -> None:
+def _password_hash(args: argparse.Namespace) -> str:
     from anki_mcp.oauth import hash_password
 
+    if args.hash is None:
+        return hash_password(_prompt_password("Login password", 12))
+    if args.hash.count("$") != 5 or not args.hash.startswith("scrypt$"):
+        sys.exit("--hash must be a line printed by anki-mcp-hash-password.")
+    return args.hash
+
+
+def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="anki-mcp-user", description=__doc__)
-    parser.add_argument("--file", type=Path, required=True, help="path of MCP_USERS_FILE")
+    parser.add_argument(
+        "--file",
+        type=Path,
+        default=Path(os.environ.get("ANKI_DATA_DIR", "/data")) / "users.json",
+        help="users file (default: $ANKI_DATA_DIR/users.json)",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
-    add = commands.add_parser("add", help="create a user; prints their bearer token once")
+    commands.add_parser("list", help="list user ids")
+    remove = commands.add_parser("remove", help="delete an account; its data directory is kept")
+    remove.add_argument("user_id")
+    hash_help = "use a hash from anki-mcp-hash-password instead of prompting"
+    add = commands.add_parser("add", help="create a user")
     add.add_argument("user_id")
+    add.add_argument("--hash", help=hash_help)
     add.add_argument("--sync-username", default="")
     add.add_argument("--sync-host", default="", help="empty for AnkiWeb")
     add.add_argument("--sync-password", action="store_true", help="prompt for the sync password")
-    add.add_argument("--no-login-password", action="store_true", help="bearer token only")
-    commands.add_parser("list", help="list user ids")
-    for name, text in (
-        ("remove", "delete a user's account; their data directory is kept"),
-        ("passwd", "set a user's OAuth login password"),
-        ("token", "replace a user's bearer token; prints it once"),
-    ):
-        commands.add_parser(name, help=text).add_argument("user_id")
+    passwd = commands.add_parser("passwd", help="set a user's login password")
+    passwd.add_argument("user_id")
+    passwd.add_argument("--hash", help=hash_help)
     args = parser.parse_args(argv)
 
-    raw = _load_raw(args.file)
+    raw = load_users_file(args.file)
     users: dict[str, Any] = raw["users"]
     if args.command == "list":
         for user_id in sorted(users):
@@ -288,31 +284,20 @@ def main(argv: list[str] | None = None) -> None:
             endpoint = validate_sync_endpoint(args.sync_host)
         except ValueError as exc:
             sys.exit(str(exc))
-        token = secrets.token_urlsafe(32)
         entry: dict[str, Any] = {
-            "token_sha256": token_hash(token),
+            "password_hash": _password_hash(args),
             "sync_username": args.sync_username,
             "sync_endpoint": endpoint,
         }
-        if not args.no_login_password:
-            entry["password_hash"] = hash_password(_prompt_password("Login password", 12))
         if args.sync_password:
             entry["sync_password"] = _prompt_password("Sync password", 1)
         users[args.user_id] = entry
-        _save_raw(args.file, raw)
-        print(token)
     elif args.command == "remove":
         del users[args.user_id]
-        _save_raw(args.file, raw)
         print(f"Removed {args.user_id}. Their collection directory was not deleted.")
-    elif args.command == "passwd":
-        users[args.user_id]["password_hash"] = hash_password(_prompt_password("Login password", 12))
-        _save_raw(args.file, raw)
     else:
-        token = secrets.token_urlsafe(32)
-        users[args.user_id]["token_sha256"] = token_hash(token)
-        _save_raw(args.file, raw)
-        print(token)
+        users[args.user_id]["password_hash"] = _password_hash(args)
+    save_users_file(args.file, raw)
 
 
 if __name__ == "__main__":

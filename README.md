@@ -16,156 +16,125 @@ review history and analytics, backups, and explicit full-sync recovery.
 
 ## Quick start with Docker Compose
 
-Requirements: Docker Compose, Python 3 for token generation, and an AnkiWeb or self-hosted
-sync account.
+Requirements: Docker Compose, an HTTPS reverse proxy for the server's public hostname, and an
+AnkiWeb or self-hosted sync account for each user.
 
 ```sh
 git clone https://github.com/raslab/anki-sync-mcp.git
 cd anki-sync-mcp
 
-mkdir -p secrets
-python -c 'import secrets; print(secrets.token_urlsafe(32))' > secrets/anki_mcp_token
-read -rsp "Anki sync password: " ANKI_PASSWORD
-printf '%s' "$ANKI_PASSWORD" > secrets/anki_sync_password
-unset ANKI_PASSWORD
-chmod 600 secrets/*
-
-export ANKI_SYNC_USERNAME="your-sync-username"
-export ANKI_SYNC_HOST="" # empty for AnkiWeb; otherwise an HTTPS sync-server URL
-
+export MCP_PUBLIC_URL="https://anki.example.com"
+export MCP_ALLOWED_HOSTS="anki.example.com"
 docker compose up -d --build
+docker compose exec anki-mcp anki-mcp-user add owner --sync-username "you@example.com"
 docker compose exec anki-mcp anki-mcp-healthcheck
 ```
 
-The included Compose configuration exposes MCP only to containers on its private `assistant`
-network. Connect your agent container to that network and configure:
+`anki-mcp-user add` prompts for the password you will sign in with. Point the reverse proxy at
+port 8000 of the `anki-mcp` container, forwarding `/mcp`, `/oauth/login`, `/authorize`,
+`/token`, `/register`, `/revoke` and `/.well-known/`. Then add `https://anki.example.com/mcp`
+as a remote MCP server in your client. The client opens a sign-in page; enter your user id and
+password. Once connected, call `anki_sync_login` once; the sync host key is stored in the
+`anki_data` volume.
 
-- URL: `http://anki-mcp:8000/mcp`
-- Header: `Authorization: Bearer <contents of secrets/anki_mcp_token>`
+For local development without a proxy, publish the port with `ports: ["127.0.0.1:8000:8000"]`
+and use `MCP_PUBLIC_URL=http://localhost:8000`; HTTP is accepted only for loopback hosts.
 
-For a client running directly on the host, add this to the `anki-mcp` service in
-`compose.yaml`, then run `docker compose up -d` again:
-
-```yaml
-ports:
-  - "127.0.0.1:8000:8000"
-```
-
-Use `http://127.0.0.1:8000/mcp` as the MCP URL. After connecting, call
-`anki_sync_login` once. The resulting sync host key is stored in the persistent Docker volume,
-so you can later remove `ANKI_SYNC_PASSWORD_FILE` from `compose.yaml` and delete the password
-secret when automatic reauthentication is not required.
-
-Do not run two sidecars, Anki Desktop, or any other process against the same collection file.
+Do not run two servers, Anki Desktop, or any other process against the same data directory.
 Keep destructive, schema, and full-sync feature flags disabled except during deliberate
 maintenance.
 
 ## Configuration
 
 Configuration is read from environment variables when the service starts. `compose.yaml`
-supplies safe defaults and mounts the authentication token and initial sync password as Docker
-secrets. Variables written as `${NAME:-default}` can be overridden through the shell or a
-Compose `.env` file. To change a fixed value, or use one of the settings not present in the
-Compose file, add it under `services.anki-mcp.environment`.
+supplies safe defaults. Variables written as `${NAME:-default}` can be overridden through the
+shell or a Compose `.env` file. To change a fixed value, or use one of the settings not present
+in the Compose file, add it under `services.anki-mcp.environment`.
 
 ### Server and access
 
 | Variable | Default | Description |
 | --- | --- | --- |
+| `MCP_PUBLIC_URL` | required | Public HTTPS origin of the server, such as `https://anki.example.com`. It is the OAuth issuer and the base of every sign-in link. HTTP is accepted only for loopback hosts. |
 | `MCP_HOST` | `0.0.0.0` | Address on which the HTTP server listens. |
 | `MCP_PORT` | `8000` | HTTP listen port (`1`-`65535`). Keep this consistent with `expose`, any `ports` mapping, and the client URL. |
 | `MCP_PATH` | `/mcp` | MCP endpoint path. It must be an absolute, static, non-root path and must not overlap `/health`. |
-| `MCP_AUTH_MODE` | `bearer` | `bearer` checks the static token below. `builtin` runs a single-owner OAuth authorization server instead (see [Built-in OAuth](#built-in-oauth)); the bearer token is then not used. |
-| `MCP_AUTH_TOKEN` | required alternative | Bearer token supplied directly. Use exactly one of this setting and `MCP_AUTH_TOKEN_FILE`; the Compose setup uses the file variant. |
-| `MCP_AUTH_TOKEN_FILE` | required alternative | Path to a file containing the bearer token. One trailing newline is ignored. Compose mounts `./secrets/anki_mcp_token` at `/run/secrets/anki_mcp_token`. |
 | `MCP_SCOPES` | `read,write,admin` | Comma-separated tool groups to register. Allowed values are `read`, `write`, `admin`, and `destructive`. Destructive tools require both the `destructive` scope and their feature flag. |
 | `MCP_ALLOWED_HOSTS` | `testserver,localhost,localhost:*,127.0.0.1,127.0.0.1:*,anki-mcp,anki-mcp:*` | Comma-separated HTTP `Host` patterns accepted by MCP DNS-rebinding protection. Add the service name or hostname used by remote clients. |
 | `MCP_ALLOWED_ORIGINS` | `http://localhost:*,http://127.0.0.1:*` | Comma-separated browser origins accepted by MCP transport security. Add explicit trusted origins when using a browser-based client. |
 | `LOG_LEVEL` | `INFO` | Log level for the server and Uvicorn, such as `debug`, `info`, `warning`, or `error`. `debug` also logs diagnostics such as redirect URIs refused during OAuth client registration, and the media sync lifecycle (start, progress, wait, abort) under the `anki_mcp.media_sync` logger. Media sync completion is logged at `info` and failures at `warning` with an error code and exception type, never the backend message. |
-
-The `/health/live` and `/health/ready` endpoints are not bearer-authenticated. The supplied
-Compose network keeps them private unless you publish the container port.
-
-### Built-in OAuth
-
-Clients that expect an OAuth flow, such as claude.ai custom connectors, can connect when
-`MCP_AUTH_MODE=builtin`. The server then acts as its own authorization server for one owner.
-It supports dynamic client registration, authorization code with PKCE, rotating refresh tokens
-and revocation. Signing in means entering the owner password on the server's `/oauth/login`
-page. Tokens are stored only as SHA-256 hashes, in `state/oauth.json` next to the collection.
-
-1. Create a password hash: `docker compose run --rm anki-mcp anki-mcp-hash-password`, or
-   `uv run anki-mcp-hash-password` locally.
-2. Set `MCP_AUTH_MODE=builtin`, `MCP_PUBLIC_URL`, and the hash.
-3. Add the public hostname to `MCP_ALLOWED_HOSTS`.
-4. Expose the server over HTTPS. The reverse proxy must forward `/mcp`, `/oauth/login`,
-   `/authorize`, `/token`, `/register`, `/revoke` and `/.well-known/`.
-5. In the client, add `https://<host>/mcp` as the connector URL.
-
-Each issued token carries every scope in `MCP_SCOPES`. Use `MCP_SCOPES` to limit what an
-internet-facing server exposes.
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `MCP_PUBLIC_URL` | required in `builtin` mode | Public HTTPS origin of the server, such as `https://anki.example.com`. It is used as the OAuth issuer. HTTP is accepted only for loopback hosts. |
-| `MCP_OAUTH_PASSWORD_HASH` | required alternative in `builtin` mode | Owner password hash from `anki-mcp-hash-password`. Use exactly one of this setting and `MCP_OAUTH_PASSWORD_HASH_FILE`. |
-| `MCP_OAUTH_PASSWORD_HASH_FILE` | required alternative in `builtin` mode | Path to a file containing the password hash. |
 | `MCP_OAUTH_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback` | Comma-separated redirect URIs that clients may register. Loopback redirect URIs (`http://localhost`, `http://127.0.0.1` or `http://[::1]` with a port) are always accepted, so local clients such as Claude Code connect without being listed: the authorization code goes only to the machine that signed in, and PKCE stops anyone else from redeeming it. A client asking for any other redirect URI is refused, so a stranger cannot register a client that sends your authorization code to their own site. |
 
-### Collection and synchronization
+The `/health/live` and `/health/ready` endpoints need no sign-in. `/health/ready` reports how
+many collections are open, never user names or paths.
+
+### Users and sign-in
+
+Every person is a user in `<ANKI_DATA_DIR>/users.json`, with their own collection at
+`<ANKI_DATA_DIR>/users/<user id>/collection.anki2`. A personal install is just one with a
+single user. Every tool, receipt, backup and confirmation token is scoped to the signed-in user.
+
+Clients connect over OAuth: the server is its own authorization server, with dynamic client
+registration, authorization code with PKCE, rotating refresh tokens and revocation. Signing in
+means entering a user id and password on the server's `/oauth/login` page. Access tokens last an
+hour and refresh tokens 30 days, renewed on every refresh, so an always-on agent that refreshes
+at least monthly stays signed in after one browser sign-in. Tokens are stored only as SHA-256
+hashes, in `<ANKI_DATA_DIR>/oauth.json`.
+
+Manage accounts with `anki-mcp-user` (it reads `ANKI_DATA_DIR`, or takes `--file`):
+
+- `add <id>` prompts for the user's password. `--sync-username`, `--sync-host` (empty for
+  AnkiWeb) and `--sync-password` set their sync account; the sync password can be removed from
+  the file once `anki_sync_login` has succeeded.
+- `passwd <id>` sets a new password. With `--hash`, it takes a line printed by
+  `anki-mcp-hash-password`, so a user can choose a password on their own machine and send only
+  its hash.
+- `remove <id>` deletes the account at once, signing out its clients; the data directory is
+  kept.
+- `list` prints the user ids.
+
+Changes take effect without a restart. User ids use `a-z`, `0-9`, `_` and `-`.
+
+A collection opens on its user's first call and closes after `ANKI_COLLECTION_IDLE_SECONDS`
+without one, so memory follows the number of active users, not registered ones.
+
+### Collection, storage and synchronization
+
+Collections are SQLite databases with random IO, so keep `ANKI_DATA_DIR` on SSD.
+`ANKI_MEDIA_ROOT` and `ANKI_BACKUP_ROOT` move the bulky media files and backups to slower,
+cheaper storage such as an HDD. The server never moves existing media: if a collection's
+`.media` folder already exists as a directory, move its contents yourself.
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `ANKI_COLLECTION_PATH` | `/data/collection.anki2` | Local Anki collection file. Compose persists its parent directory in the `anki_data` volume; do not point multiple processes at the same file. |
-| `ANKI_SYNC_USERNAME` | empty | AnkiWeb username or self-hosted sync username. Required for `anki_sync_login` and for bootstrap when no persisted authentication exists. |
-| `ANKI_SYNC_PASSWORD` | optional alternative | Sync password supplied directly. It is optional after authentication has been persisted; do not set it together with `ANKI_SYNC_PASSWORD_FILE`. |
-| `ANKI_SYNC_PASSWORD_FILE` | optional alternative | Path to the sync-password file. Compose mounts `./secrets/anki_sync_password` at `/run/secrets/anki_sync_password`. Remove the setting and secret after login if automatic reauthentication is not needed. |
-| `ANKI_SYNC_HOST` | empty (AnkiWeb) | Custom sync-server HTTP(S) base URL. Non-loopback servers require HTTPS; credentials, query strings, and fragments are rejected. |
+| `ANKI_DATA_DIR` | `/data` | Holds `users.json`, `oauth.json` and one directory per user. Compose persists it in the `anki_data` volume. |
+| `ANKI_MAX_OPEN_COLLECTIONS` | `100` | Most user collections open at once (`1`-`10000`). At the limit the least recently used idle one is closed; when none is idle, the call fails with `RESOURCE_LIMIT_EXCEEDED` and can be retried. Size it from memory: each open collection costs a few MB plus its SQLite cache. |
+| `ANKI_COLLECTION_IDLE_SECONDS` | `900` | Close a user's collection after this many seconds without a call (`10`-`86400`). A collection with a media sync running stays open. |
+| `ANKI_MEDIA_ROOT` | unset | Directory for media files, one subdirectory per user. The collection's `.media` folder becomes a symlink to it. |
+| `ANKI_BACKUP_ROOT` | unset | Directory for verified backups, one subdirectory per user, instead of `backups/` next to the collection. |
 | `ANKI_SYNC_ON_READ` | `false` | Synchronize before coordinated reads. Individual read tools can still request a sync with `sync_before=true`. |
 | `ANKI_SYNC_ON_WRITE` | `true` | Synchronize before and after coordinated mutations. Disabling this permits local changes to remain unsynchronized. |
 | `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Seconds a background media sync may go without reporting progress before it is aborted (`> 0`, up to `3600`). A sync that keeps advancing is never cut off; an aborted one resumes from the files already transferred on the next sync. |
 | `ANKI_MEDIA_SYNC_WAIT_SECONDS` | `10` | How long `anki_sync` waits for media synchronization before returning `media_sync.state = "in_progress"` (`0`-`60` seconds; `0` returns immediately). Media sync continues in the background; follow it with `anki_status`. |
 | `ANKI_INITIAL_MEDIA_SYNC` | `true` | Once authenticated, start a media sync on startup and keep retrying with backoff until one completes. Until then `anki_status` reports `ready: false` (`initial_media_sync_in_progress` or `initial_media_sync_failed`) and `anki_media_*` tools return `MEDIA_SYNC_IN_PROGRESS`; other tools and `/health/ready` are unaffected. A media write made while a later media sync is still running returns `MEDIA_SYNC_IN_PROGRESS`; retry it with the same idempotency key once `anki_status` shows the sync finished. Set `false` for deployments with no media. |
-| `ANKI_BOOTSTRAP_MODE` | `disabled` | Startup behavior: `disabled`, or `download_if_empty` to authenticate and perform a download-only initialization when the local collection is empty. A non-empty collection is left untouched and the server starts normally, so the setting can stay on across restarts. Startup fails rather than uploading if the server requests a full upload. |
+| `ANKI_BOOTSTRAP_MODE` | `disabled` | `disabled`, or `download_if_empty` to sign in to the user's sync account and download their collection the first time it opens while empty. A non-empty collection is left untouched, so the setting can stay on. The download fails rather than uploading if the server requests a full upload. |
 
-The persisted `anki_data` volume also contains synchronization authentication state, mutation
-receipts, and backups. Preserve the volume across container recreation.
+Preserve the `anki_data` volume across container recreation: it holds every user's
+collection, sync login, mutation receipts and backups.
 
-### Multiple users
+### Upgrading from a single-collection install
 
-Setting `MCP_USERS_FILE` serves several people from one server, each with their own collection
-at `<directory of ANKI_COLLECTION_PATH>/users/<user id>/collection.anki2`. A collection opens on
-its user's first call and closes after `ANKI_COLLECTION_IDLE_SECONDS` without one, so memory
-follows the number of active users, not registered ones. Every tool, receipt, backup and
-confirmation token is scoped to the caller.
+Earlier versions kept one collection at `ANKI_COLLECTION_PATH` and took credentials from
+environment variables. On first start, the server moves that collection, its `.media` folder,
+`state/` and `backups/` into `users/owner/`, and writes an `owner` user from
+`MCP_OAUTH_PASSWORD_HASH` and the `ANKI_SYNC_*` settings. OAuth clients signed in before the
+upgrade keep working as `owner`. Bearer-token clients do not: if the install used a bearer
+token, set a password with `anki-mcp-user passwd owner` and sign the client in over OAuth.
 
-Manage accounts with `anki-mcp-user --file <path> add|remove|passwd|token|list <user id>`.
-`add` prints the user's bearer token once and prompts for an OAuth login password (skip it with
-`--no-login-password`). Give each user's sync account with `--sync-username`, `--sync-host` and
-`--sync-password` (the password can be removed from the file once `anki_sync_login` has
-succeeded). Changes take effect without a restart; a removed user's tokens stop working at once,
-and their data directory is kept. User ids use `a-z`, `0-9`, `_` and `-`.
-
-In `bearer` mode each request authenticates with its user's token. In `builtin` mode the login
-page asks for a user id and password. `MCP_AUTH_TOKEN`, `MCP_OAUTH_PASSWORD_HASH` and the
-`ANKI_SYNC_*` account settings are per user in this mode and must be unset. The server refuses
-to start if a single-user collection exists at `ANKI_COLLECTION_PATH`: move it, with its
-`.media` folder, `state/` and `backups/`, to `users/<user id>/` (renaming the file to
-`collection.anki2`) first.
-
-Collections are SQLite databases with random IO, so keep `ANKI_COLLECTION_PATH` on SSD.
-`ANKI_MEDIA_ROOT` and `ANKI_BACKUP_ROOT` move the bulky media files and backups to slower,
-cheaper storage such as an HDD; they also work in single-user mode, where the user id is
-`default`. The server never moves existing media: if the collection's `.media` folder already
-exists as a directory, move its contents yourself.
-
-| Variable | Default | Description |
-| --- | --- | --- |
-| `MCP_USERS_FILE` | unset | Path of the users file managed by `anki-mcp-user`. Setting it enables multi-user mode. Keep it on persistent storage, readable only by the server. |
-| `ANKI_MAX_OPEN_COLLECTIONS` | `100` | Most user collections open at once (`1`-`10000`). At the limit the least recently used idle one is closed; when none is idle, the call fails with `RESOURCE_LIMIT_EXCEEDED` and can be retried. Size it from memory: each open collection costs a few MB plus its SQLite cache. |
-| `ANKI_COLLECTION_IDLE_SECONDS` | `900` | Close a user's collection after this many seconds without a call (`10`-`86400`). A collection with a media sync running stays open. |
-| `ANKI_MEDIA_ROOT` | unset | Directory for media files, one subdirectory per user. The collection's `.media` folder becomes a symlink to it. |
-| `ANKI_BACKUP_ROOT` | unset | Directory for verified backups, one subdirectory per user, instead of `backups/` next to the collection. |
+The old settings (`MCP_AUTH_MODE`, `MCP_AUTH_TOKEN`, `MCP_OAUTH_PASSWORD_HASH`,
+`ANKI_COLLECTION_PATH` and the `ANKI_SYNC_*` account settings) are then ignored with a warning;
+remove them. If a migration is interrupted, the server refuses to start and names the folder to
+finish by hand.
 
 ### Safety and resource limits
 

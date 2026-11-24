@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 from anki.collection import Collection
+from conftest import owner_collection_path, use_owner
 from starlette.testclient import TestClient
 
 from anki_mcp.app import create_app
@@ -19,7 +20,7 @@ pytestmark = pytest.mark.usefixtures("person_approves")
 
 @pytest.fixture
 def phase3_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[Settings]:
-    collection_path = tmp_path / "collection.anki2"
+    collection_path = owner_collection_path(tmp_path)
     collection = Collection(str(collection_path))
     try:
         deck_id = collection.decks.id("Guarded")
@@ -30,8 +31,7 @@ def phase3_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator
         collection.add_note(note, deck_id)
     finally:
         collection.close()
-    monkeypatch.setenv("MCP_AUTH_TOKEN", "phase3-token")
-    monkeypatch.setenv("ANKI_COLLECTION_PATH", str(collection_path))
+    use_owner(monkeypatch, tmp_path, "phase3-token")
     monkeypatch.setenv("ANKI_SYNC_ON_WRITE", "false")
     monkeypatch.setenv("MCP_SCOPES", "read,write,admin,destructive")
     monkeypatch.setenv("ANKI_ALLOW_DESTRUCTIVE", "true")
@@ -102,7 +102,7 @@ def test_confirmation_tokens_are_short_lived_single_use_and_request_bound() -> N
 def test_guarded_note_deletion_requires_matching_preview_and_creates_backup(
     phase3_settings: Settings,
 ) -> None:
-    collection = Collection(str(phase3_settings.collection_path))
+    collection = Collection(str(phase3_settings.user_collection_path("owner")))
     try:
         note_id = int(collection.find_notes("guarded note")[0])
     finally:
@@ -141,7 +141,7 @@ def test_guarded_note_deletion_requires_matching_preview_and_creates_backup(
         backup_path = Path(receipt["result"]["backup"]["path"])
         assert backup_path.is_file()
 
-    collection = Collection(str(phase3_settings.collection_path))
+    collection = Collection(str(phase3_settings.user_collection_path("owner")))
     try:
         assert collection.find_notes("guarded note") == []
     finally:
@@ -393,7 +393,7 @@ def test_native_backup_failure_is_redacted_from_client(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    sensitive_detail = f"failed to write {phase3_settings.collection_path}"
+    sensitive_detail = f"failed to write {phase3_settings.user_collection_path('owner')}"
 
     def fail_backup(*args: object, **kwargs: object) -> bool:
         raise RuntimeError(sensitive_detail)
@@ -445,7 +445,7 @@ async def test_tag_delete_preview_honors_search_scan_bound(
     phase3_settings: Settings,
 ) -> None:
     async with AnkiCollectionService(
-        phase3_settings.collection_path,
+        phase3_settings.user_collection_path("owner"),
         max_page_size=100,
         max_search_scan=0,
         sync_on_write=False,
@@ -483,14 +483,14 @@ def test_review_answer_tool_is_omitted_unless_explicitly_enabled(
 async def test_review_answer_records_real_scheduling_change(
     phase3_settings: Settings,
 ) -> None:
-    collection = Collection(str(phase3_settings.collection_path))
+    collection = Collection(str(phase3_settings.user_collection_path("owner")))
     try:
         card_id = int(collection.find_cards("guarded note")[0])
     finally:
         collection.close()
 
     async with AnkiCollectionService(
-        phase3_settings.collection_path,
+        phase3_settings.user_collection_path("owner"),
         max_page_size=100,
         sync_on_write=False,
     ) as service:

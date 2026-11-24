@@ -1,40 +1,40 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Literal, Self
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def validate_sync_endpoint(value: str) -> str:
     """Validate a custom sync endpoint without exposing embedded credentials."""
     if any(character.isspace() for character in value):
-        raise ValueError("ANKI_SYNC_HOST must not contain whitespace")
+        raise ValueError("sync endpoint must not contain whitespace")
     endpoint = value.strip()
     if not endpoint:
         return ""
     parsed = urlsplit(endpoint)
     if len(endpoint.encode("utf-8")) > 2048:
-        raise ValueError("ANKI_SYNC_HOST must not exceed 2048 UTF-8 bytes")
+        raise ValueError("sync endpoint must not exceed 2048 UTF-8 bytes")
     try:
         hostname = parsed.hostname
     except ValueError as exc:
-        raise ValueError("ANKI_SYNC_HOST contains an invalid hostname") from exc
+        raise ValueError("sync endpoint contains an invalid hostname") from exc
     if not parsed.netloc or not hostname or parsed.scheme not in {"http", "https"}:
-        raise ValueError("ANKI_SYNC_HOST must be empty or an HTTP(S) base URL")
+        raise ValueError("sync endpoint must be empty or an HTTP(S) base URL")
     try:
         _ = parsed.port
     except ValueError as exc:
-        raise ValueError("ANKI_SYNC_HOST contains an invalid port") from exc
+        raise ValueError("sync endpoint contains an invalid port") from exc
     if parsed.username is not None or parsed.password is not None:
-        raise ValueError("ANKI_SYNC_HOST must not contain user information")
+        raise ValueError("sync endpoint must not contain user information")
     if parsed.query or parsed.fragment:
-        raise ValueError("ANKI_SYNC_HOST must not contain a query or fragment")
+        raise ValueError("sync endpoint must not contain a query or fragment")
     loopback_hosts = {"localhost", "127.0.0.1", "::1"}
     if parsed.scheme == "http" and parsed.hostname not in loopback_hosts:
-        raise ValueError("ANKI_SYNC_HOST requires HTTPS except for loopback development")
+        raise ValueError("sync endpoint requires HTTPS except for loopback development")
     return endpoint
 
 
@@ -85,10 +85,7 @@ def _parse_media_url_hosts(entries: list[str], source: str) -> frozenset[str]:
 
 
 class Settings(BaseSettings):
-    """Validated process configuration.
-
-    Token material is resolved once at startup and retained as a SecretStr.
-    """
+    """Validated process configuration."""
 
     model_config = SettingsConfigDict(
         env_file=None,
@@ -101,28 +98,18 @@ class Settings(BaseSettings):
     host: str = Field("0.0.0.0", alias="MCP_HOST")
     port: int = Field(8000, ge=1, le=65535, alias="MCP_PORT")
     mcp_path: str = Field("/mcp", alias="MCP_PATH")
-    auth_mode: Literal["bearer", "builtin"] = Field("bearer", alias="MCP_AUTH_MODE")
-    public_url: str = Field("", alias="MCP_PUBLIC_URL")
-    oauth_password_hash_input: SecretStr | None = Field(None, alias="MCP_OAUTH_PASSWORD_HASH")
-    oauth_password_hash_file: Path | None = Field(None, alias="MCP_OAUTH_PASSWORD_HASH_FILE")
+    public_url: str = Field(alias="MCP_PUBLIC_URL")
     oauth_redirect_uris_csv: str = Field(
         "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback",
         alias="MCP_OAUTH_REDIRECT_URIS",
     )
-    auth_token_input: SecretStr | None = Field(None, alias="MCP_AUTH_TOKEN")
-    auth_token_file: Path | None = Field(None, alias="MCP_AUTH_TOKEN_FILE")
-    collection_path: Path = Field(Path("/data/collection.anki2"), alias="ANKI_COLLECTION_PATH")
-    users_file: Path | None = Field(None, alias="MCP_USERS_FILE")
+    data_dir: Path = Field(Path("/data"), alias="ANKI_DATA_DIR")
     max_open_collections: int = Field(100, ge=1, le=10_000, alias="ANKI_MAX_OPEN_COLLECTIONS")
     collection_idle_seconds: float = Field(
         900, ge=10, le=86_400, alias="ANKI_COLLECTION_IDLE_SECONDS"
     )
     media_root: Path | None = Field(None, alias="ANKI_MEDIA_ROOT")
     backup_root: Path | None = Field(None, alias="ANKI_BACKUP_ROOT")
-    sync_username: str = Field("", alias="ANKI_SYNC_USERNAME")
-    sync_password_input: SecretStr | None = Field(None, alias="ANKI_SYNC_PASSWORD")
-    sync_password_file: Path | None = Field(None, alias="ANKI_SYNC_PASSWORD_FILE")
-    sync_host: str = Field("", alias="ANKI_SYNC_HOST")
     scopes_csv: str = Field("read,write,admin", alias="MCP_SCOPES")
     sync_on_read: bool = Field(False, alias="ANKI_SYNC_ON_READ")
     sync_on_write: bool = Field(True, alias="ANKI_SYNC_ON_WRITE")
@@ -165,19 +152,13 @@ class Settings(BaseSettings):
     allowed_origins_csv: str = Field(
         "http://localhost:*,http://127.0.0.1:*", alias="MCP_ALLOWED_ORIGINS"
     )
-    auth_token: SecretStr = Field(default=SecretStr(""), exclude=True)
-    sync_password: SecretStr | None = Field(default=None, exclude=True)
-    oauth_password_hash: SecretStr | None = Field(default=None, exclude=True)
 
     @property
-    def sync_endpoint(self) -> str | None:
-        endpoint = self.sync_host.strip()
-        return endpoint or None
+    def users_file(self) -> Path:
+        return self.data_dir / "users.json"
 
-    @field_validator("sync_host")
-    @classmethod
-    def valid_sync_host(cls, value: str) -> str:
-        return validate_sync_endpoint(value)
+    def user_collection_path(self, user_id: str) -> Path:
+        return self.data_dir / "users" / user_id / "collection.anki2"
 
     @field_validator("mcp_path")
     @classmethod
@@ -200,38 +181,16 @@ class Settings(BaseSettings):
         )
 
     @model_validator(mode="after")
-    def validate_builtin_auth(self) -> Self:
-        if self.auth_mode != "builtin":
-            return self
+    def validate_public_url(self) -> Self:
         parsed = urlsplit(self.public_url)
         loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
         if not parsed.netloc or not (parsed.scheme == "https" or loopback):
-            raise ValueError("MCP_AUTH_MODE=builtin requires an HTTPS MCP_PUBLIC_URL")
+            raise ValueError("MCP_PUBLIC_URL must be HTTPS except for loopback development")
         if parsed.query or parsed.fragment or parsed.path.strip("/"):
             raise ValueError("MCP_PUBLIC_URL must be an origin without path, query or fragment")
         self.public_url = f"{parsed.scheme}://{parsed.netloc}"
         if not self.oauth_redirect_uris:
             raise ValueError("MCP_OAUTH_REDIRECT_URIS must list at least one redirect URI")
-        return self
-
-    @property
-    def multi_user(self) -> bool:
-        return self.users_file is not None
-
-    @model_validator(mode="after")
-    def validate_multi_user(self) -> Self:
-        if not self.multi_user:
-            return self
-        shared = {
-            "ANKI_SYNC_USERNAME": self.sync_username,
-            "ANKI_SYNC_PASSWORD": self.sync_password,
-            "ANKI_SYNC_HOST": self.sync_host,
-            "MCP_AUTH_TOKEN": self.auth_token.get_secret_value(),
-            "MCP_OAUTH_PASSWORD_HASH": self.oauth_password_hash,
-        }
-        conflicting = sorted(name for name, value in shared.items() if value)
-        if conflicting:
-            raise ValueError(f"MCP_USERS_FILE sets these per user; unset {', '.join(conflicting)}")
         return self
 
     @property
@@ -283,63 +242,3 @@ class Settings(BaseSettings):
                 "MCP_MAX_RESPONSE_BYTES must be at least MCP_MAX_RENDERED_FIELD_BYTES + 4096"
             )
         return self
-
-    @model_validator(mode="before")
-    @classmethod
-    def resolve_secrets(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-        values = dict(data)
-
-        def resolve(
-            direct_alias: str,
-            direct_field: str,
-            file_alias: str,
-            file_field: str,
-            description: str,
-            required: bool = True,
-        ) -> SecretStr | None:
-            direct = values.get(direct_alias, values.get(direct_field))
-            file_value = values.get(file_alias, values.get(file_field))
-            if direct is None and file_value is None and not required:
-                return None
-            if (direct is not None) == (file_value is not None):
-                raise ValueError(f"exactly one of {direct_alias} and {file_alias} is required")
-            if direct is not None:
-                raw = direct.get_secret_value() if isinstance(direct, SecretStr) else str(direct)
-            else:
-                try:
-                    raw = Path(str(file_value)).read_text(encoding="utf-8").removesuffix("\n")
-                except OSError as exc:
-                    raise ValueError(f"unable to read {file_alias}") from exc
-            if not raw:
-                raise ValueError(f"{description} must not be empty")
-            return SecretStr(raw)
-
-        builtin = values.get("MCP_AUTH_MODE", values.get("auth_mode", "bearer")) == "builtin"
-        multi_user = values.get("MCP_USERS_FILE", values.get("users_file")) is not None
-        values["auth_token"] = resolve(
-            "MCP_AUTH_TOKEN",
-            "auth_token_input",
-            "MCP_AUTH_TOKEN_FILE",
-            "auth_token_file",
-            "MCP authentication token",
-            required=not builtin and not multi_user,
-        ) or SecretStr("")
-        values["oauth_password_hash"] = resolve(
-            "MCP_OAUTH_PASSWORD_HASH",
-            "oauth_password_hash_input",
-            "MCP_OAUTH_PASSWORD_HASH_FILE",
-            "oauth_password_hash_file",
-            "OAuth password hash",
-            required=builtin and not multi_user,
-        )
-        values["sync_password"] = resolve(
-            "ANKI_SYNC_PASSWORD",
-            "sync_password_input",
-            "ANKI_SYNC_PASSWORD_FILE",
-            "sync_password_file",
-            "Anki sync password",
-            required=False,
-        )
-        return values
