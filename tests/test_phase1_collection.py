@@ -504,6 +504,42 @@ async def test_controlled_bootstrap_downloads_only_into_an_empty_collection(
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize(("initial_media_sync", "expected_usn"), [(True, 9), (False, None)])
+async def test_bootstrap_passes_server_media_usn_only_for_initial_media_sync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    initial_media_sync: bool,
+    expected_usn: int | None,
+) -> None:
+    path = str(tmp_path / "fresh.anki2")
+    Collection(path).close()
+    server_usns: list[int | None] = []
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="key", endpoint=endpoint),
+    )
+    monkeypatch.setattr(
+        Collection,
+        "sync_collection",
+        lambda self, auth, sync_media: SyncOutput(required=3, server_media_usn=9),
+    )
+    monkeypatch.setattr(Collection, "create_backup", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        Collection,
+        "full_upload_or_download",
+        lambda self, *, auth, server_usn, upload: server_usns.append(server_usn),
+    )
+
+    async with AnkiCollectionService(
+        path, max_page_size=100, initial_media_sync=initial_media_sync
+    ) as service:
+        await service.bootstrap("download_if_empty", "user", "password", None)
+
+    assert server_usns == [expected_usn]
+
+
+@pytest.mark.anyio
 async def test_controlled_bootstrap_skips_a_nonempty_local_collection(
     collection_path: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

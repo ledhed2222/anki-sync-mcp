@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     max_media_bytes: int = Field(1_048_576, ge=1, le=16_777_216, alias="ANKI_MAX_MEDIA_BYTES")
     sync_timeout_seconds: float = Field(300, gt=0, le=3600, alias="ANKI_SYNC_TIMEOUT_SECONDS")
     media_sync_wait_seconds: float = Field(10, ge=0, le=60, alias="ANKI_MEDIA_SYNC_WAIT_SECONDS")
+    initial_media_sync: bool = Field(True, alias="ANKI_INITIAL_MEDIA_SYNC")
     max_response_bytes: int = Field(
         1_048_576, ge=1024, le=16_777_216, alias="MCP_MAX_RESPONSE_BYTES"
     )

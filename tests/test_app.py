@@ -1949,3 +1949,80 @@ def test_tool_errors_are_machine_readable(
     assert internal["code"] == "INTERNAL_ERROR"
     assert internal["message"] == "internal collection operation failed"
     assert "collection.anki2" not in json.dumps(internal)
+
+
+def test_initial_media_sync_starts_on_startup_and_guards_media_tools(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    sync_calls: list[bool] = []
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="key", endpoint=endpoint),
+    )
+
+    def sync_collection(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        sync_calls.append(sync_media)
+        return SyncOutput(required=0)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync_collection)
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.media_sync_status",
+        lambda self: MediaSyncStatusResponse(active=True),
+    )
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(settings)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+
+        def call(request_id: int, name: str, arguments: dict[str, object]) -> dict[str, Any]:
+            return custom_client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+            ).json()["result"]
+
+        assert call(2, "anki_sync_login", {}).get("isError") is not True
+        # No tool starts it: the startup driver notices the login and begins the media sync.
+        deadline = time.monotonic() + 10
+        while not sync_calls:
+            assert time.monotonic() < deadline, "initial media sync never started"
+            time.sleep(0.05)
+        status = json.loads(call(3, "anki_status", {})["content"][0]["text"])
+        guarded = call(4, "anki_media_list", {})
+        decks = call(5, "anki_decks_list", {})
+        readiness = custom_client.get("/health/ready")
+
+    text = guarded["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert sync_calls == [True]
+    assert status["ready"] is False
+    assert status["readiness_reason"] == "initial_media_sync_in_progress"
+    assert guarded["isError"] is True
+    assert payload["code"] == "MEDIA_SYNC_IN_PROGRESS"
+    assert payload["details"]["media_sync"]["state"] == "in_progress"
+    assert decks.get("isError") is not True
+    assert readiness.status_code == 200
