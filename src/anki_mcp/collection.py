@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time
@@ -2296,16 +2297,15 @@ class CollectionAdapter:
 
     def list_media(self, offset: int, limit: int) -> dict[str, Any]:
         self._require_initial_media_sync()
-        items = []
-        for path in Path(self.collection.media.dir()).iterdir():
-            if path.is_file() and not path.is_symlink():
-                items.append({"filename": path.name, "size_bytes": path.stat().st_size})
-                if len(items) > self.max_search_scan:
-                    raise ValueError(
-                        "collection exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
-                    )
-        sorted_items = sorted(items, key=lambda item: item["filename"].casefold())
-        return self._page(sorted_items, offset, limit)
+        media_dir = Path(self.collection.media.dir())
+        with os.scandir(media_dir) as entries:
+            names = [entry.name for entry in entries if entry.is_file(follow_symlinks=False)]
+        page = self._page(sorted(names, key=str.casefold), offset, limit)
+        page["items"] = [
+            {"filename": name, "size_bytes": (media_dir / name).stat().st_size}
+            for name in page["items"]
+        ]
+        return page
 
     def get_media(self, filename: str) -> dict[str, Any]:
         path = self._media_path(filename, require_exists=True)

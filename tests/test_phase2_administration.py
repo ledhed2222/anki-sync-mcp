@@ -872,3 +872,23 @@ async def test_initial_media_sync_disabled_leaves_readiness_and_media_alone(
 
     assert sync_calls == []
     assert status["ready"] is True
+
+
+@pytest.mark.anyio
+async def test_media_list_pages_folders_larger_than_scan_bound(phase2_collection: str) -> None:
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=2, max_search_scan=1
+    ) as service:
+        media_dir = Path(phase2_collection).with_suffix(".media")
+        for name in ("c.png", "A.png", "b.png"):
+            (media_dir / name).write_bytes(b"xy")
+        first = await service.list_media(0, 2)
+        second = await service.list_media(2, 2)
+
+    assert first["items"] == [
+        {"filename": "A.png", "size_bytes": 2},
+        {"filename": "b.png", "size_bytes": 2},
+    ]
+    assert (first["total"], first["has_more"]) == (3, True)
+    assert second["items"] == [{"filename": "c.png", "size_bytes": 2}]
+    assert second["has_more"] is False
