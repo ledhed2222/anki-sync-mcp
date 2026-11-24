@@ -112,6 +112,13 @@ class Settings(BaseSettings):
     auth_token_input: SecretStr | None = Field(None, alias="MCP_AUTH_TOKEN")
     auth_token_file: Path | None = Field(None, alias="MCP_AUTH_TOKEN_FILE")
     collection_path: Path = Field(Path("/data/collection.anki2"), alias="ANKI_COLLECTION_PATH")
+    users_file: Path | None = Field(None, alias="MCP_USERS_FILE")
+    max_open_collections: int = Field(100, ge=1, le=10_000, alias="ANKI_MAX_OPEN_COLLECTIONS")
+    collection_idle_seconds: float = Field(
+        900, ge=10, le=86_400, alias="ANKI_COLLECTION_IDLE_SECONDS"
+    )
+    media_root: Path | None = Field(None, alias="ANKI_MEDIA_ROOT")
+    backup_root: Path | None = Field(None, alias="ANKI_BACKUP_ROOT")
     sync_username: str = Field("", alias="ANKI_SYNC_USERNAME")
     sync_password_input: SecretStr | None = Field(None, alias="ANKI_SYNC_PASSWORD")
     sync_password_file: Path | None = Field(None, alias="ANKI_SYNC_PASSWORD_FILE")
@@ -208,6 +215,26 @@ class Settings(BaseSettings):
         return self
 
     @property
+    def multi_user(self) -> bool:
+        return self.users_file is not None
+
+    @model_validator(mode="after")
+    def validate_multi_user(self) -> Self:
+        if not self.multi_user:
+            return self
+        shared = {
+            "ANKI_SYNC_USERNAME": self.sync_username,
+            "ANKI_SYNC_PASSWORD": self.sync_password,
+            "ANKI_SYNC_HOST": self.sync_host,
+            "MCP_AUTH_TOKEN": self.auth_token.get_secret_value(),
+            "MCP_OAUTH_PASSWORD_HASH": self.oauth_password_hash,
+        }
+        conflicting = sorted(name for name, value in shared.items() if value)
+        if conflicting:
+            raise ValueError(f"MCP_USERS_FILE sets these per user; unset {', '.join(conflicting)}")
+        return self
+
+    @property
     def allowed_hosts(self) -> list[str]:
         return [item.strip() for item in self.allowed_hosts_csv.split(",") if item.strip()]
 
@@ -290,13 +317,14 @@ class Settings(BaseSettings):
             return SecretStr(raw)
 
         builtin = values.get("MCP_AUTH_MODE", values.get("auth_mode", "bearer")) == "builtin"
+        multi_user = values.get("MCP_USERS_FILE", values.get("users_file")) is not None
         values["auth_token"] = resolve(
             "MCP_AUTH_TOKEN",
             "auth_token_input",
             "MCP_AUTH_TOKEN_FILE",
             "auth_token_file",
             "MCP authentication token",
-            required=not builtin,
+            required=not builtin and not multi_user,
         ) or SecretStr("")
         values["oauth_password_hash"] = resolve(
             "MCP_OAUTH_PASSWORD_HASH",
@@ -304,7 +332,7 @@ class Settings(BaseSettings):
             "MCP_OAUTH_PASSWORD_HASH_FILE",
             "oauth_password_hash_file",
             "OAuth password hash",
-            required=builtin,
+            required=builtin and not multi_user,
         )
         values["sync_password"] = resolve(
             "ANKI_SYNC_PASSWORD",

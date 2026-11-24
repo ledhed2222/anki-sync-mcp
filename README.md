@@ -131,6 +131,42 @@ internet-facing server exposes.
 The persisted `anki_data` volume also contains synchronization authentication state, mutation
 receipts, and backups. Preserve the volume across container recreation.
 
+### Multiple users
+
+Setting `MCP_USERS_FILE` serves several people from one server, each with their own collection
+at `<directory of ANKI_COLLECTION_PATH>/users/<user id>/collection.anki2`. A collection opens on
+its user's first call and closes after `ANKI_COLLECTION_IDLE_SECONDS` without one, so memory
+follows the number of active users, not registered ones. Every tool, receipt, backup and
+confirmation token is scoped to the caller.
+
+Manage accounts with `anki-mcp-user --file <path> add|remove|passwd|token|list <user id>`.
+`add` prints the user's bearer token once and prompts for an OAuth login password (skip it with
+`--no-login-password`). Give each user's sync account with `--sync-username`, `--sync-host` and
+`--sync-password` (the password can be removed from the file once `anki_sync_login` has
+succeeded). Changes take effect without a restart; a removed user's tokens stop working at once,
+and their data directory is kept. User ids use `a-z`, `0-9`, `_` and `-`.
+
+In `bearer` mode each request authenticates with its user's token. In `builtin` mode the login
+page asks for a user id and password. `MCP_AUTH_TOKEN`, `MCP_OAUTH_PASSWORD_HASH` and the
+`ANKI_SYNC_*` account settings are per user in this mode and must be unset. The server refuses
+to start if a single-user collection exists at `ANKI_COLLECTION_PATH`: move it, with its
+`.media` folder, `state/` and `backups/`, to `users/<user id>/` (renaming the file to
+`collection.anki2`) first.
+
+Collections are SQLite databases with random IO, so keep `ANKI_COLLECTION_PATH` on SSD.
+`ANKI_MEDIA_ROOT` and `ANKI_BACKUP_ROOT` move the bulky media files and backups to slower,
+cheaper storage such as an HDD; they also work in single-user mode, where the user id is
+`default`. The server never moves existing media: if the collection's `.media` folder already
+exists as a directory, move its contents yourself.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCP_USERS_FILE` | unset | Path of the users file managed by `anki-mcp-user`. Setting it enables multi-user mode. Keep it on persistent storage, readable only by the server. |
+| `ANKI_MAX_OPEN_COLLECTIONS` | `100` | Most user collections open at once (`1`-`10000`). At the limit the least recently used idle one is closed; when none is idle, the call fails with `RESOURCE_LIMIT_EXCEEDED` and can be retried. Size it from memory: each open collection costs a few MB plus its SQLite cache. |
+| `ANKI_COLLECTION_IDLE_SECONDS` | `900` | Close a user's collection after this many seconds without a call (`10`-`86400`). A collection with a media sync running stays open. |
+| `ANKI_MEDIA_ROOT` | unset | Directory for media files, one subdirectory per user. The collection's `.media` folder becomes a symlink to it. |
+| `ANKI_BACKUP_ROOT` | unset | Directory for verified backups, one subdirectory per user, instead of `backups/` next to the collection. |
+
 ### Safety and resource limits
 
 | Variable | Default | Description |

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hmac
+from collections.abc import Callable
 from typing import Any
 
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -58,10 +61,17 @@ class RequestBodyLimitMiddleware:
 class BearerAuthMiddleware:
     """Authenticate every request under the configured MCP endpoint."""
 
-    def __init__(self, app: ASGIApp, token: str, mcp_path: str = "/mcp") -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        token: str,
+        mcp_path: str = "/mcp",
+        resolve_user: Callable[[str], str | None] | None = None,
+    ) -> None:
         self.app = app
         self._expected = token.encode("utf-8")
         self._path = mcp_path.rstrip("/")
+        self._resolve_user = resolve_user
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = scope.get("path", "")
@@ -70,9 +80,17 @@ class BearerAuthMiddleware:
             authorization = headers.get(b"authorization", b"")
             scheme, separator, supplied = authorization.partition(b" ")
             has_bearer_scheme = separator == b" " and scheme.lower() == b"bearer"
-            # Always execute compare_digest, including malformed/missing credentials.
-            token_matches = hmac.compare_digest(supplied, self._expected)
-            valid = has_bearer_scheme and token_matches
+            if self._resolve_user is not None:
+                user_id = self._resolve_user(supplied.decode("utf-8", "replace"))
+                valid = has_bearer_scheme and user_id is not None
+                if valid:
+                    scope["user"] = AuthenticatedUser(
+                        AccessToken(token="", client_id="bearer", scopes=[], subject=user_id)
+                    )
+            else:
+                # Always execute compare_digest, including malformed/missing credentials.
+                token_matches = hmac.compare_digest(supplied, self._expected)
+                valid = has_bearer_scheme and token_matches
             if not valid:
                 response = JSONResponse(
                     {"error": "authentication_failed"},

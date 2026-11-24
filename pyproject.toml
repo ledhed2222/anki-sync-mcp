@@ -21,6 +21,7 @@ dependencies = [
 anki-mcp = "anki_mcp.__main__:main"
 anki-mcp-healthcheck = "anki_mcp.healthcheck:main"
 anki-mcp-hash-password = "anki_mcp.oauth:main"
+anki-mcp-user = "anki_mcp.users:main"
 
 [dependency-groups]
 dev = [

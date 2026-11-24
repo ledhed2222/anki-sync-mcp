@@ -6,6 +6,7 @@ import json
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Any, Generic, Literal, NoReturn, TypeVar, cast
 from uuid import uuid4
 
@@ -56,6 +57,7 @@ from anki_mcp.media_url import (
     download_media,
 )
 from anki_mcp.oauth import BuiltinOAuthProvider
+from anki_mcp.users import CollectionRegistry, UserStore
 
 T = TypeVar("T")
 LOGGER = logging.getLogger(__name__)
@@ -542,27 +544,126 @@ FsrsSimulationResult = Annotated[
 ]
 
 
+_DEFAULT_USER = "default"
+
+
+class _CurrentUserService:
+    """Stand-in for one collection service that forwards each call to the caller's own."""
+
+    def __init__(self, registry: CollectionRegistry, user_id: Callable[[], str]) -> None:
+        self._registry = registry
+        self._user_id = user_id
+
+    def __getattr__(self, name: str) -> Callable[..., Awaitable[Any]]:
+        async def call(*args: Any, **kwargs: Any) -> Any:
+            async with self._registry.lease(self._user_id()) as service:
+                return await getattr(service, name)(*args, **kwargs)
+
+        return call
+
+
+def _link_media_folder(collection_path: Path, target: Path) -> None:
+    """Point the collection's media folder at ANKI_MEDIA_ROOT; never move existing media."""
+    link = collection_path.with_suffix(".media")
+    target.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink():
+        if link.resolve() != target.resolve():
+            raise RuntimeError(f"{link} links to {link.resolve()}, not ANKI_MEDIA_ROOT ({target})")
+        return
+    if link.exists():
+        raise RuntimeError(
+            f"{link} is a directory but ANKI_MEDIA_ROOT is set; move its contents to {target} "
+            "and remove it"
+        )
+    link.symlink_to(target, target_is_directory=True)
+
+
+def _refuse_single_user_layout(collection_path: Path) -> None:
+    if collection_path.exists():
+        raise RuntimeError(
+            f"MCP_USERS_FILE is set but a single-user collection exists at {collection_path}; "
+            "move it with its .media folder, state/ and backups/ into "
+            f"{collection_path.parent / 'users' / '<user id>'}/ (renaming the collection to "
+            "collection.anki2), or unset MCP_USERS_FILE"
+        )
+
+
 def create_app(settings: Settings) -> ASGIApp:
     """Create the complete ASGI application and MCP registry."""
 
-    service = AnkiCollectionService(
-        settings.collection_path,
-        settings.max_page_size,
-        settings.max_search_scan,
-        settings.max_rendered_field_bytes,
-        settings.max_card_fields,
-        settings.max_batch_size,
-        settings.max_media_bytes,
-        settings.sync_timeout_seconds,
-        settings.sync_on_read,
-        settings.sync_on_write,
-        settings.media_sync_wait_seconds,
-        settings.initial_media_sync,
+    users = UserStore(settings.users_file) if settings.users_file is not None else None
+
+    def new_service(collection_path: Path, user_id: str) -> AnkiCollectionService:
+        if settings.media_root is not None:
+            _link_media_folder(collection_path, settings.media_root / user_id)
+        return AnkiCollectionService(
+            collection_path,
+            settings.max_page_size,
+            settings.max_search_scan,
+            settings.max_rendered_field_bytes,
+            settings.max_card_fields,
+            settings.max_batch_size,
+            settings.max_media_bytes,
+            settings.sync_timeout_seconds,
+            settings.sync_on_read,
+            settings.sync_on_write,
+            settings.media_sync_wait_seconds,
+            settings.initial_media_sync,
+            settings.backup_root / user_id if settings.backup_root is not None else None,
+        )
+
+    def sync_credentials(user_id: str) -> tuple[str, str | None, str | None]:
+        if users is None:
+            password = settings.sync_password
+            return (
+                settings.sync_username,
+                password.get_secret_value() if password is not None else None,
+                settings.sync_endpoint,
+            )
+        user = users.get(user_id)
+        if user is None:
+            raise LookupError(f"user {user_id!r} no longer exists")
+        return user.sync_username, user.sync_password, user.sync_endpoint
+
+    async def open_user_service(user_id: str) -> AnkiCollectionService:
+        user_dir = settings.collection_path.parent / "users" / user_id
+        user_dir.mkdir(parents=True, exist_ok=True)
+        opened = new_service(user_dir / "collection.anki2", user_id)
+        await asyncio.to_thread(opened.executor.start)
+        try:
+            if settings.bootstrap_mode != "disabled":
+                await opened.bootstrap(settings.bootstrap_mode, *sync_credentials(user_id))
+        except BaseException:
+            await opened.__aexit__()
+            raise
+        return opened
+
+    registry = CollectionRegistry(
+        open_user_service, settings.max_open_collections, settings.collection_idle_seconds
+    )
+
+    def current_user_id() -> str:
+        if users is None:
+            return _DEFAULT_USER
+        request = mcp.get_context().request_context.request
+        user = request.scope.get("user") if request is not None else None
+        subject = getattr(getattr(user, "access_token", None), "subject", None)
+        if not isinstance(subject, str) or users.get(subject) is None:
+            raise PermissionError("request is not authenticated as a known user")
+        return subject
+
+    default_service = (
+        new_service(settings.collection_path, _DEFAULT_USER) if users is None else None
+    )
+    service: Any = (
+        default_service
+        if default_service is not None
+        else _CurrentUserService(registry, lambda: current_user_id())
     )
     oauth_provider: BuiltinOAuthProvider | None = None
     auth_settings: AuthSettings | None = None
     if settings.auth_mode == "builtin":
-        oauth_provider = BuiltinOAuthProvider(settings)
+        oauth_provider = BuiltinOAuthProvider(settings, users)
         auth_settings = AuthSettings(
             issuer_url=AnyHttpUrl(settings.public_url),
             resource_server_url=AnyHttpUrl(settings.public_url + settings.mcp_path),
@@ -590,7 +691,13 @@ def create_app(settings: Settings) -> ASGIApp:
     )
     registered_tool_names: list[str] = []
     conditional_sync_tool_names: set[str] = set()
-    confirmations = ConfirmationRegistry(settings.confirmation_ttl_seconds)
+    confirmation_registries: dict[str, ConfirmationRegistry] = {}
+
+    def confirmations() -> ConfirmationRegistry:
+        # Tokens are bound to the user who previewed, so one user can never spend another's.
+        return confirmation_registries.setdefault(
+            current_user_id(), ConfirmationRegistry(settings.confirmation_ttl_seconds)
+        )
 
     def scoped_tool(
         name: str,
@@ -701,6 +808,8 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("INVALID_ARGUMENT", str(exc), exc)
         except SyncLoginRequiredError as exc:
             raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
+        except PermissionError as exc:
+            raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
         except MediaSyncFailedError as exc:
             raise_tool_error("MEDIA_SYNC_FAILED", str(exc), exc)
         except MediaSyncInProgressError as exc:
@@ -755,7 +864,7 @@ def create_app(settings: Settings) -> ASGIApp:
         return {
             "operation": operation,
             "impact": impact,
-            "confirmation_token": confirmations.issue(
+            "confirmation_token": confirmations().issue(
                 operation, {"request": request, "impact": impact}
             ),
             "expires_in_seconds": settings.confirmation_ttl_seconds,
@@ -806,17 +915,19 @@ def create_app(settings: Settings) -> ASGIApp:
         *,
         sync_media: bool = False,
     ) -> dict[str, Any]:
+        user_confirmations = confirmations()
+
         def guarded(adapter: CollectionAdapter) -> dict[str, Any]:
             current_impact = preview_function(adapter)
             confirmation_request = {"request": guard_request, "impact": current_impact}
             try:
-                confirmations.validate(confirmation_token, operation, confirmation_request)
+                user_confirmations.validate(confirmation_token, operation, confirmation_request)
             except ValueError as exc:
                 raise ConfirmationRequiredError(f"{exc}; run preview again") from exc
 
             def confirmed_mutation() -> dict[str, Any]:
                 try:
-                    confirmations.consume(confirmation_token, operation, confirmation_request)
+                    user_confirmations.consume(confirmation_token, operation, confirmation_request)
                 except ValueError as exc:
                     raise ConfirmationRequiredError(f"{exc}; run preview again") from exc
                 return function(adapter)
@@ -824,7 +935,7 @@ def create_app(settings: Settings) -> ASGIApp:
             return adapter.backup_before(confirmed_mutation)
 
         # A spent token never mutates: it replays a stored receipt or the guard refuses it.
-        previewed = confirmations.describe(confirmation_token)
+        previewed = user_confirmations.describe(confirmation_token)
         if previewed is not None:
             change = guard_request.get("request", {})
 
@@ -877,19 +988,17 @@ def create_app(settings: Settings) -> ASGIApp:
     @scoped_tool(name="anki_sync_login", scope="admin")
     async def sync_login() -> dict[str, Any]:
         """Authenticate to the configured AnkiWeb or self-hosted sync endpoint."""
-        if not settings.sync_username.strip():
+        try:
+            username, password, endpoint = sync_credentials(current_user_id())
+        except (LookupError, PermissionError) as exc:
+            raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
+        if not username.strip():
             cause = ValueError("ANKI_SYNC_USERNAME is not configured")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        if settings.sync_password is None:
+        if password is None:
             cause = ValueError("ANKI_SYNC_PASSWORD is not configured")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-        return await execute(
-            service.sync_login(
-                settings.sync_username,
-                settings.sync_password.get_secret_value(),
-                settings.sync_endpoint,
-            )
-        )
+        return await execute(service.sync_login(username, password, endpoint))
 
     @scoped_tool(name="anki_sync", scope="write")
     async def sync(sync_media: SyncMedia = True) -> dict[str, Any]:
@@ -1153,11 +1262,12 @@ def create_app(settings: Settings) -> ASGIApp:
         """
         guard_request = {"config_id": config_id, "search": search, "health_check": health_check}
         request = {**guard_request, "confirmation_token": confirmation_token}
+        user_confirmations = confirmations()
 
         def guarded(adapter: CollectionAdapter) -> dict[str, Any]:
             current_impact = adapter.preview_fsrs_optimization(config_id, search, health_check)
             try:
-                confirmations.consume(
+                user_confirmations.consume(
                     confirmation_token,
                     "anki_fsrs_optimize_apply",
                     {"request": guard_request, "impact": current_impact},
@@ -1168,7 +1278,7 @@ def create_app(settings: Settings) -> ASGIApp:
                 config_id, search, health_check, impact=current_impact
             )
 
-        previewed = confirmations.describe(confirmation_token)
+        previewed = user_confirmations.describe(confirmation_token)
         if previewed is not None:
             await confirm_with_human("anki_fsrs_optimize_apply", previewed)
         result = await mutate("anki_fsrs_optimize_apply", idempotency_key, request, guarded)
@@ -2262,8 +2372,17 @@ def create_app(settings: Settings) -> ASGIApp:
         return JSONResponse({"status": "ok"})
 
     async def ready(_: Request) -> Response:
+        if default_service is None:
+            return JSONResponse(
+                {
+                    "status": "ready",
+                    "open_collections": registry.open_count,
+                    "max_open_collections": registry.max_open,
+                    "evictions": registry.evictions,
+                }
+            )
         try:
-            current_status = await service.status()
+            current_status = await default_service.status()
         except Exception:
             current_status = {"ready": False, "readiness_reason": "collection_unavailable"}
         if current_status["readiness_reason"] not in _PROCESS_READY_REASONS:
@@ -2276,32 +2395,50 @@ def create_app(settings: Settings) -> ASGIApp:
             )
         return JSONResponse({"status": "ready"})
 
-    async def drive_initial_media_sync() -> None:
+    async def drive_initial_media_sync(single: AnkiCollectionService) -> None:
         while True:
             try:
-                if not await service.advance_initial_media_sync():
+                if not await single.advance_initial_media_sync():
                     return
             except Exception:
                 LOGGER.exception("initial media sync step failed")
             await asyncio.sleep(_INITIAL_MEDIA_SYNC_POLL_SECONDS)
 
+    async def drive_open_collections() -> None:
+        """Multi-user: close idle collections and advance each open one's initial media sync."""
+        sweep_every = min(settings.collection_idle_seconds / 4, 60.0)
+        last_sweep = 0.0
+        while True:
+            if settings.initial_media_sync:
+                await registry.for_each_open(lambda opened: opened.advance_initial_media_sync())
+            now = asyncio.get_running_loop().time()
+            if now - last_sweep >= sweep_every:
+                last_sweep = now
+                try:
+                    await registry.close_idle()
+                except Exception:
+                    LOGGER.exception("closing idle collections failed")
+            await asyncio.sleep(_INITIAL_MEDIA_SYNC_POLL_SECONDS)
+
     @asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncGenerator[None]:
-        async with service, mcp_app.router.lifespan_context(mcp_app):
+        if default_service is None:
+            _refuse_single_user_layout(settings.collection_path)
+            async with mcp_app.router.lifespan_context(mcp_app):
+                driver = asyncio.create_task(drive_open_collections())
+                try:
+                    yield
+                finally:
+                    driver.cancel()
+                    await registry.close_all()
+            return
+        async with default_service, mcp_app.router.lifespan_context(mcp_app):
             if settings.bootstrap_mode != "disabled":
-                password = (
-                    settings.sync_password.get_secret_value()
-                    if settings.sync_password is not None
-                    else None
-                )
-                await service.bootstrap(
-                    settings.bootstrap_mode,
-                    settings.sync_username,
-                    password,
-                    settings.sync_endpoint,
+                await default_service.bootstrap(
+                    settings.bootstrap_mode, *sync_credentials(_DEFAULT_USER)
                 )
             driver = (
-                asyncio.create_task(drive_initial_media_sync())
+                asyncio.create_task(drive_initial_media_sync(default_service))
                 if settings.initial_media_sync
                 else None
             )
@@ -2319,7 +2456,8 @@ def create_app(settings: Settings) -> ASGIApp:
     ]
     app = Starlette(routes=routes, middleware=mcp_app.user_middleware, lifespan=lifespan)
     app.state.settings = settings
-    app.state.collection_service = service
+    app.state.collection_service = default_service
+    app.state.collection_registry = registry
     app.state.mcp = mcp
     limited: ASGIApp = RequestBodyLimitMiddleware(
         app, settings.max_request_bytes, settings.mcp_path
@@ -2332,4 +2470,7 @@ def create_app(settings: Settings) -> ASGIApp:
         limited,
         settings.auth_token.get_secret_value(),
         settings.mcp_path,
+        (lambda token: user.id if (user := users.by_token(token)) else None)
+        if users is not None
+        else None,
     )
