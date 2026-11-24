@@ -1357,9 +1357,18 @@ def create_app(settings: Settings) -> ASGIApp:
 
     @scoped_tool(name="anki_notes_create_batch", scope="write")
     async def notes_create_batch(
-        notes: list[NoteCreateInput], idempotency_key: IdempotencyKey | None = None
+        notes: list[NoteCreateInput],
+        skip_duplicates: bool = False,
+        idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Create a bounded atomic batch of validated notes with one idempotency key."""
+        """Create a bounded atomic batch of validated notes with one idempotency key.
+
+        With skip_duplicates, notes whose first field duplicates an existing note (or an
+        earlier note in the batch) are skipped instead of failing the batch; each result in
+        request order has status "created" (with note_id and card_ids) or "duplicate" (with
+        duplicate_of, the id of the note it duplicates).
+        Any other error still fails the whole batch.
+        """
         if not notes or len(notes) > settings.max_batch_size:
             cause = ValueError(f"notes must contain between 1 and {settings.max_batch_size} items")
             raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
@@ -1367,8 +1376,8 @@ def create_app(settings: Settings) -> ASGIApp:
         return await mutate(
             "anki_notes_create_batch",
             idempotency_key,
-            {"notes": requests},
-            lambda adapter: adapter.create_notes_batch(requests),
+            {"notes": requests, "skip_duplicates": skip_duplicates},
+            lambda adapter: adapter.create_notes_batch(requests, skip_duplicates=skip_duplicates),
         )
 
     @scoped_tool(name="anki_notes_update_fields", scope="write")
