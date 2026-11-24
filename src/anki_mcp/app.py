@@ -654,6 +654,20 @@ def create_app(settings: Settings) -> ASGIApp:
             result.update(items=items[:kept], limit=kept, has_more=True)
         return result
 
+    def note_type_update_request(
+        note_type_id: int,
+        name: str | None,
+        fields: list[str] | None,
+        templates: list[dict[str, str]] | None,
+        css: str | None,
+    ) -> dict[str, Any]:
+        changes = {"name": name, "fields": fields, "templates": templates, "css": css}
+        sent = {key: value for key, value in changes.items() if value is not None}
+        if not sent:
+            cause = ValueError("note type update requires name, fields, templates, or css")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        return {"note_type_id": note_type_id, **sent}
+
     async def execute(
         operation: Awaitable[T], receipt: Callable[[T], dict[str, Any]] | None = None
     ) -> T | dict[str, Any]:
@@ -1819,7 +1833,7 @@ def create_app(settings: Settings) -> ASGIApp:
         name: ResourceName | None = None,
         fields: list[ResourceName] | None = None,
         templates: list[NoteTypeTemplateInput] | None = None,
-        css: CardText = "",
+        css: CardText | None = None,
         field_mappings: FieldMappings | None = None,
         template_mappings: TemplateMappings | None = None,
         kind: NoteTypeKind | None = None,
@@ -1861,7 +1875,7 @@ def create_app(settings: Settings) -> ASGIApp:
                 "name": name,
                 "fields": fields,
                 "templates": template_values,
-                "css": css,
+                "css": css or "",
                 "kind": kind or "standard",
             }
         elif kind is not None:
@@ -1870,23 +1884,16 @@ def create_app(settings: Settings) -> ASGIApp:
         elif operation == "update":
             if (
                 note_type_id is None
-                or name is None
-                or fields is None
-                or template_values is None
                 or field_mapping_values is not None
                 or template_mapping_values is not None
             ):
                 cause = ValueError(
-                    "update preview requires note_type_id, name, fields, templates, and css"
+                    "update preview requires note_type_id and any of name, fields, templates, css"
                 )
                 raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
-            mutation_request = {
-                "note_type_id": note_type_id,
-                "name": name,
-                "fields": fields,
-                "templates": template_values,
-                "css": css,
-            }
+            mutation_request = note_type_update_request(
+                note_type_id, name, fields, template_values, css
+            )
         elif operation == "fields_update":
             if (
                 note_type_id is None
@@ -1975,22 +1982,21 @@ def create_app(settings: Settings) -> ASGIApp:
     )
     async def note_types_update(
         note_type_id: StableId,
-        name: ResourceName,
-        fields: list[ResourceName],
-        templates: list[NoteTypeTemplateInput],
         confirmation_token: ConfirmationToken,
-        css: CardText = "",
+        name: ResourceName | None = None,
+        fields: list[ResourceName] | None = None,
+        templates: list[NoteTypeTemplateInput] | None = None,
+        css: CardText | None = None,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Replace note-type data after guarded full-sync maintenance approval."""
-        template_values = [template.model_dump() for template in templates]
-        request = {
-            "note_type_id": note_type_id,
-            "name": name,
-            "fields": fields,
-            "templates": template_values,
-            "css": css,
-        }
+        """Change a note type's name, fields, templates, or CSS after guarded approval.
+
+        Omitted values are left unchanged.
+        """
+        template_values = (
+            [template.model_dump() for template in templates] if templates is not None else None
+        )
+        request = note_type_update_request(note_type_id, name, fields, template_values, css)
         return await guarded_mutate(
             "anki_note_types_update",
             idempotency_key,

@@ -1085,6 +1085,24 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
         assert isinstance(parsed, dict)
         return parsed
 
+    def error_code(name: str, arguments: dict[str, object]) -> str:
+        nonlocal request_id
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments},
+            },
+        )
+        request_id += 1
+        result = response.json()["result"]
+        assert result["isError"] is True
+        text = result["content"][0]["text"]
+        return str(json.loads(text[text.index("{") :])["code"])
+
     deck = call("anki_decks_create", {"name": "CRUD"})
     existing_deck = call("anki_decks_create", {"name": "CRUD"})
     deck_id = deck["result"]["id"]
@@ -1167,6 +1185,61 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
             ],
             "confirmation_token": update_token,
         },
+    )
+    before_css = call("anki_note_types_get", {"note_type_id": note_type_id})
+    css_token = call(
+        "anki_note_types_change_preview",
+        {"operation": "update", "note_type_id": note_type_id, "css": ".card { color: red; }"},
+    )["confirmation_token"]
+    assert (
+        error_code(
+            "anki_note_types_update",
+            {
+                "note_type_id": note_type_id,
+                "css": ".card { color: red; }",
+                "templates": [
+                    {
+                        "name": "Prompt Card",
+                        "question_format": "changed {{Prompt}}",
+                        "answer_format": "{{Response}}",
+                    }
+                ],
+                "confirmation_token": css_token,
+            },
+        )
+        == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+    )
+    assert call("anki_note_types_get", {"note_type_id": note_type_id}) == before_css
+    css_token = call(
+        "anki_note_types_change_preview",
+        {"operation": "update", "note_type_id": note_type_id, "css": ".card { color: red; }"},
+    )["confirmation_token"]
+    call(
+        "anki_note_types_update",
+        {
+            "note_type_id": note_type_id,
+            "css": ".card { color: red; }",
+            "confirmation_token": css_token,
+        },
+    )
+    after_css = call("anki_note_types_get", {"note_type_id": note_type_id})
+    assert after_css["css"] == ".card { color: red; }"
+    assert {key: value for key, value in after_css.items() if key != "css"} == {
+        key: value for key, value in before_css.items() if key != "css"
+    }
+    assert (
+        error_code(
+            "anki_note_types_change_preview",
+            {"operation": "update", "note_type_id": note_type_id},
+        )
+        == "INVALID_ARGUMENT"
+    )
+    assert (
+        error_code(
+            "anki_note_types_update",
+            {"note_type_id": note_type_id, "confirmation_token": css_token},
+        )
+        == "INVALID_ARGUMENT"
     )
     resources_deck = call("anki_decks_create", {"name": "Resource CRUD"})
     resources_deck_id = resources_deck["result"]["id"]
