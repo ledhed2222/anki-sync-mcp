@@ -1806,6 +1806,8 @@ class CollectionAdapter:
 
     def _existing_duplicate_id(self, note_type_id: int, fields: dict[str, str]) -> int | None:
         model = self.collection.models.get(cast("NotetypeId", note_type_id))
+        if model is None:  # pragma: no cover - _prepare_note already validated the note type
+            return None
         first_field = fields[self.collection.models.field_names(model)[0]]
         search = self.collection.build_search_string(
             SearchNode(dupe=SearchNode.Dupe(notetype_id=note_type_id, first_field=first_field))
