@@ -872,3 +872,66 @@ async def test_initial_media_sync_disabled_leaves_readiness_and_media_alone(
 
     assert sync_calls == []
     assert status["ready"] is True
+
+
+@pytest.mark.anyio
+async def test_media_list_pages_folders_larger_than_scan_bound(phase2_collection: str) -> None:
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=2, max_search_scan=1
+    ) as service:
+        media_dir = Path(phase2_collection).with_suffix(".media")
+        for name in ("c.png", "A.png", "b.png"):
+            (media_dir / name).write_bytes(b"xy")
+        first = await service.list_media(0, 2)
+        second = await service.list_media(2, 2)
+
+    assert first["items"] == [
+        {"filename": "A.png", "size_bytes": 2},
+        {"filename": "b.png", "size_bytes": 2},
+    ]
+    assert (first["total"], first["has_more"]) == (3, True)
+    assert second["items"] == [{"filename": "c.png", "size_bytes": 2}]
+    assert second["has_more"] is False
+
+
+class _FakeEntry:
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def is_file(self, *, follow_symlinks: bool) -> bool:
+        return True
+
+
+class _FakeScandir:
+    def __init__(self, names: list[str]) -> None:
+        self._entries = [_FakeEntry(name) for name in names]
+
+    def __enter__(self) -> list[_FakeEntry]:
+        return self._entries
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+@pytest.mark.anyio
+async def test_media_list_orders_case_variants_stably_and_skips_vanished_files(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    listings = iter([["a.png", "A.png", "gone.png"], ["gone.png", "A.png", "a.png"]] * 2)
+    monkeypatch.setattr(
+        "anki_mcp.collection.os.scandir", lambda _path: _FakeScandir(next(listings))
+    )
+    async with AnkiCollectionService(phase2_collection, max_page_size=1) as service:
+        media_dir = Path(phase2_collection).with_suffix(".media")
+        for name in ("A.png", "a.png"):
+            (media_dir / name).write_bytes(b"x")
+        pages = [await service.list_media(offset, 1) for offset in range(3)]
+        repeat = await service.list_media(0, 1)
+
+    assert [page["items"] for page in pages] == [
+        [{"filename": "A.png", "size_bytes": 1}],
+        [{"filename": "a.png", "size_bytes": 1}],
+        [],
+    ]
+    assert pages[2]["total"] == 3
+    assert repeat["items"] == [{"filename": "A.png", "size_bytes": 1}]
