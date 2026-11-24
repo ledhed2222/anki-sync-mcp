@@ -175,7 +175,9 @@ async def test_media_consistency_check_returns_bounded_missing_and_unused_files(
     finally:
         collection.close()
 
-    async with AnkiCollectionService(phase2_collection, max_page_size=100) as service:
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, max_search_scan=0
+    ) as service:
         await service.store_media("unused.txt", base64.b64encode(b"unused").decode())
         checked = await service.check_media(offset=0, limit=10)
 
