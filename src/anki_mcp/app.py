@@ -79,6 +79,7 @@ Tags = Annotated[list[Tag], Field(max_length=100)]
 NoteFields = dict[Annotated[StrictStr, Field(min_length=1, max_length=512)], CardText]
 ConfirmationToken = Annotated[StrictStr, Field(min_length=1, max_length=256)]
 SchemaChangeOperation = Literal["create", "update", "fields_update", "templates_update"]
+NoteTypeKind = Literal["standard", "cloze"]
 ReviewRating = Annotated[StrictInt, Field(ge=1, le=4)]
 AnswerSeconds = Annotated[StrictInt, Field(ge=0, le=86_400)]
 ReviewOrder = Literal["newest", "oldest"]
@@ -1785,6 +1786,7 @@ def create_app(settings: Settings) -> ASGIApp:
         css: CardText = "",
         field_mappings: FieldMappings | None = None,
         template_mappings: TemplateMappings | None = None,
+        kind: NoteTypeKind | None = None,
     ) -> dict[str, Any]:
         """Preview an exact proposed schema mutation and issue a maintenance token."""
         operation_names = {
@@ -1815,14 +1817,20 @@ def create_app(settings: Settings) -> ASGIApp:
                 or field_mapping_values is not None
                 or template_mapping_values is not None
             ):
-                cause = ValueError("create preview requires only name, fields, templates, and css")
+                cause = ValueError(
+                    "create preview requires only name, fields, templates, css, and kind"
+                )
                 raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
             mutation_request = {
                 "name": name,
                 "fields": fields,
                 "templates": template_values,
                 "css": css,
+                "kind": kind or "standard",
             }
+        elif kind is not None:
+            cause = ValueError("kind applies only to the create operation")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
         elif operation == "update":
             if (
                 note_type_id is None
@@ -1901,11 +1909,18 @@ def create_app(settings: Settings) -> ASGIApp:
         templates: list[NoteTypeTemplateInput],
         confirmation_token: ConfirmationToken,
         css: CardText = "",
+        kind: NoteTypeKind = "standard",
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Create a note type after preview, backup, and full-sync maintenance gating."""
+        """Create a standard or cloze note type after preview, backup, and full-sync gating."""
         template_values = [template.model_dump() for template in templates]
-        request = {"name": name, "fields": fields, "templates": template_values, "css": css}
+        request = {
+            "name": name,
+            "fields": fields,
+            "templates": template_values,
+            "css": css,
+            "kind": kind,
+        }
         return await guarded_mutate(
             "anki_note_types_create",
             idempotency_key,
@@ -1913,7 +1928,7 @@ def create_app(settings: Settings) -> ASGIApp:
             confirmation_token,
             {"operation": "create", "request": request},
             lambda adapter: adapter.preview_note_type_change("create", None),
-            lambda adapter: adapter.create_note_type(name, fields, template_values, css),
+            lambda adapter: adapter.create_note_type(name, fields, template_values, css, kind),
         )
 
     @scoped_tool(
