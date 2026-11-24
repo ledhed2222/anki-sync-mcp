@@ -1317,6 +1317,79 @@ def test_critical_resource_crud_tools_work_through_json_rpc(client: TestClient) 
     assert deck_deleted["result"]["deleted"] is True
 
 
+def test_media_store_downloads_url_from_allowed_host(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from anki_mcp.media_url import MediaDownloadError
+
+    downloads: list[tuple[str, frozenset[str], int]] = []
+
+    def fake_download(url: str, hosts: frozenset[str], max_bytes: int) -> bytes:
+        downloads.append((url, hosts, max_bytes))
+        if url.endswith("missing.woff2"):
+            raise MediaDownloadError("MEDIA_URL_NOT_FOUND", "url returned HTTP 404")
+        return b"font bytes"
+
+    monkeypatch.setattr("anki_mcp.app.download_media", fake_download)
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    initialized = client.post(
+        "/mcp",
+        headers=headers,
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {"name": "pytest", "version": "1"},
+            },
+        },
+    )
+    headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+
+    def call(request_id: int, arguments: dict[str, object]) -> dict[str, Any]:
+        return client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": "anki_media_store", "arguments": arguments},
+            },
+        ).json()["result"]
+
+    def error_code(result: dict[str, Any]) -> str:
+        text = result["content"][0]["text"]
+        return json.loads(text[text.index("{") :])["code"]
+
+    url = "https://cdn.jsdelivr.net/npm/@fontsource/inter@5.0.0/files/inter-latin-400-normal.woff2"
+    stored = call(2, {"filename": "inter.woff2", "url": url})
+    both = call(3, {"filename": "x.woff2", "url": url, "content_base64": "eA=="})
+    neither = call(4, {"filename": "x.woff2"})
+    missing = call(5, {"filename": "x.woff2", "url": "https://cdn.jsdelivr.net/missing.woff2"})
+    script = call(7, {"filename": "x.js", "url": url})
+
+    receipt = json.loads(stored["content"][0]["text"])
+    assert receipt["result"] == {"filename": "inter.woff2", "size_bytes": 10, "created": True}
+    tools = client.post(
+        "/mcp", headers=headers, json={"jsonrpc": "2.0", "id": 6, "method": "tools/list"}
+    ).json()["result"]["tools"]
+    description = next(t["description"] for t in tools if t["name"] == "anki_media_store")
+    assert "upload.wikimedia.org" in description
+    assert downloads[0][0] == url
+    assert downloads[0][2] == 1_048_576
+    assert error_code(both) == "INVALID_ARGUMENT"
+    assert error_code(neither) == "INVALID_ARGUMENT"
+    assert error_code(missing) == "MEDIA_URL_NOT_FOUND"
+    assert error_code(script) == "MEDIA_TYPE_NOT_ALLOWED"
+    assert len(downloads) == 2
+
+
 def test_sync_tools_use_server_configuration_without_exposing_credentials(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

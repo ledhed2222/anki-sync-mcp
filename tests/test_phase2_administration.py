@@ -636,6 +636,44 @@ async def test_stalled_media_sync_is_aborted_and_reported_failed_by_status(
 
 
 @pytest.mark.anyio
+async def test_media_write_during_a_running_media_sync_is_retryable(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    media_active = {"value": True}
+    _patch_sync(monkeypatch)
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.media_sync_status",
+        lambda self: _media_status(media_active["value"]),
+    )
+    content = base64.b64encode(b"font").decode()
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, media_sync_wait_seconds=0
+    ) as service:
+        await service.sync_login("user", "password", None)
+        await service.sync(sync_media=True)
+        with pytest.raises(MediaSyncInProgressError, match="a media sync is running"):
+            await service.coordinated_mutation(
+                operation="anki_media_store",
+                idempotency_key="store-during-sync",
+                request={"filename": "font.woff2"},
+                mutate=lambda adapter: adapter.store_media("font.woff2", content),
+                sync_media=True,
+            )
+        media_active["value"] = False
+        retried = await service.coordinated_mutation(
+            operation="anki_media_store",
+            idempotency_key="store-during-sync",
+            request={"filename": "font.woff2"},
+            mutate=lambda adapter: adapter.store_media("font.woff2", content),
+            sync_media=True,
+        )
+
+    assert retried["state"] == "committed"
+    assert retried["result"] == {"filename": "font.woff2", "size_bytes": 4, "created": True}
+
+
+@pytest.mark.anyio
 async def test_mutation_receipt_stays_retryable_until_media_sync_finishes(
     phase2_collection: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

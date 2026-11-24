@@ -44,6 +44,8 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.max_rendered_field_bytes == 262_144
     assert settings.max_card_fields == 100
     assert settings.max_media_bytes == 1_048_576
+    assert "upload.wikimedia.org" in settings.media_url_hosts
+    assert "cdn.jsdelivr.net" in settings.media_url_hosts
     assert settings.sync_timeout_seconds == 300
     assert settings.media_sync_wait_seconds == 10
     assert settings.max_response_bytes == 1_048_576
@@ -281,3 +283,30 @@ def test_scopes_and_phase_one_safety_settings_are_validated(tmp_path: Path) -> N
         Settings(_env_file=None, **env(tmp_path, ANKI_BOOTSTRAP_MODE="upload"))
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **env(tmp_path, ANKI_MAX_BATCH_SIZE="0"))
+
+
+def test_media_url_hosts_come_from_env_or_file(tmp_path) -> None:
+    from_env = Settings(_env_file=None, **env(tmp_path, ANKI_MEDIA_URL_HOSTS=" Example.org, "))
+    hosts_file = tmp_path / "hosts.txt"
+    hosts_file.write_text("# fonts\ncdn.example.org  # cdn\n\nimg.example.org\n")
+    from_file = Settings(_env_file=None, **env(tmp_path, ANKI_MEDIA_URL_HOSTS_FILE=str(hosts_file)))
+    empty = Settings(_env_file=None, **env(tmp_path, ANKI_MEDIA_URL_HOSTS=""))
+
+    assert from_env.media_url_hosts == frozenset({"example.org"})
+    assert from_file.media_url_hosts == frozenset({"cdn.example.org", "img.example.org"})
+    assert empty.media_url_hosts == frozenset()
+    with pytest.raises(ValidationError, match="bare hostnames"):
+        Settings(_env_file=None, **env(tmp_path, ANKI_MEDIA_URL_HOSTS="https://example.org"))
+    with pytest.raises(ValidationError, match="at most one"):
+        Settings(
+            _env_file=None,
+            **env(
+                tmp_path,
+                ANKI_MEDIA_URL_HOSTS="example.org",
+                ANKI_MEDIA_URL_HOSTS_FILE=str(hosts_file),
+            ),
+        )
+    with pytest.raises(ValidationError, match="unable to read"):
+        Settings(
+            _env_file=None, **env(tmp_path, ANKI_MEDIA_URL_HOSTS_FILE=str(tmp_path / "missing"))
+        )

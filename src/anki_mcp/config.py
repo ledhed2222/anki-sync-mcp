@@ -61,6 +61,29 @@ def validate_sync_migration_endpoint(value: str, configured_endpoint: str | None
     return endpoint
 
 
+# Public static-content hosts: npm/GitHub CDNs (Fontsource fonts), Google Fonts files and
+# Wikipedia/Wikimedia Commons media.
+_DEFAULT_MEDIA_URL_HOSTS = (
+    "cdn.jsdelivr.net",
+    "fonts.gstatic.com",
+    "raw.githubusercontent.com",
+    "unpkg.com",
+    "upload.wikimedia.org",
+)
+
+
+def _parse_media_url_hosts(entries: list[str], source: str) -> frozenset[str]:
+    hosts = set()
+    for entry in entries:
+        host = entry.split("#", 1)[0].strip().casefold().rstrip(".")
+        if not host:
+            continue
+        if any(character in host for character in "/:@") or any(c.isspace() for c in host):
+            raise ValueError(f"{source} entries must be bare hostnames, got {entry.strip()!r}")
+        hosts.add(host)
+    return frozenset(hosts)
+
+
 class Settings(BaseSettings):
     """Validated process configuration.
 
@@ -120,6 +143,9 @@ class Settings(BaseSettings):
     sync_timeout_seconds: float = Field(300, gt=0, le=3600, alias="ANKI_SYNC_TIMEOUT_SECONDS")
     media_sync_wait_seconds: float = Field(10, ge=0, le=60, alias="ANKI_MEDIA_SYNC_WAIT_SECONDS")
     initial_media_sync: bool = Field(True, alias="ANKI_INITIAL_MEDIA_SYNC")
+    media_url_hosts_csv: str | None = Field(None, alias="ANKI_MEDIA_URL_HOSTS")
+    media_url_hosts_file: Path | None = Field(None, alias="ANKI_MEDIA_URL_HOSTS_FILE")
+    media_url_hosts: frozenset[str] = Field(default=frozenset(), exclude=True)
     max_response_bytes: int = Field(
         1_048_576, ge=1024, le=16_777_216, alias="MCP_MAX_RESPONSE_BYTES"
     )
@@ -188,6 +214,26 @@ class Settings(BaseSettings):
     @property
     def allowed_origins(self) -> list[str]:
         return [item.strip() for item in self.allowed_origins_csv.split(",") if item.strip()]
+
+    @model_validator(mode="after")
+    def resolve_media_url_hosts(self) -> Self:
+        if self.media_url_hosts_csv is not None and self.media_url_hosts_file is not None:
+            raise ValueError(
+                "set at most one of ANKI_MEDIA_URL_HOSTS and ANKI_MEDIA_URL_HOSTS_FILE"
+            )
+        if self.media_url_hosts_file is not None:
+            try:
+                lines = self.media_url_hosts_file.read_text(encoding="utf-8").splitlines()
+            except OSError as exc:
+                raise ValueError("unable to read ANKI_MEDIA_URL_HOSTS_FILE") from exc
+            self.media_url_hosts = _parse_media_url_hosts(lines, "ANKI_MEDIA_URL_HOSTS_FILE")
+        elif self.media_url_hosts_csv is not None:
+            self.media_url_hosts = _parse_media_url_hosts(
+                self.media_url_hosts_csv.split(","), "ANKI_MEDIA_URL_HOSTS"
+            )
+        else:
+            self.media_url_hosts = frozenset(_DEFAULT_MEDIA_URL_HOSTS)
+        return self
 
     @property
     def scopes(self) -> frozenset[str]:

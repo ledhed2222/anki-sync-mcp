@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -48,6 +49,12 @@ from anki_mcp.collection import (
 )
 from anki_mcp.config import Settings
 from anki_mcp.guard import ConfirmationRegistry
+from anki_mcp.media_url import (
+    URL_MEDIA_EXTENSIONS,
+    MediaDownloadError,
+    check_media_filename,
+    download_media,
+)
 from anki_mcp.oauth import BuiltinOAuthProvider
 
 T = TypeVar("T")
@@ -69,6 +76,7 @@ Tag = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 ResourceName = Annotated[StrictStr, Field(min_length=1, max_length=512)]
 MediaFilename = Annotated[StrictStr, Field(min_length=1, max_length=255)]
 MediaContent = Annotated[StrictStr, Field(min_length=1, max_length=22_369_624)]
+MediaUrl = Annotated[StrictStr, Field(min_length=1, max_length=2048)]
 StableIds = Annotated[list[StableId], Field(min_length=1, max_length=500)]
 NonNegativeInt = Annotated[StrictInt, Field(ge=0)]
 PositiveInt = Annotated[StrictInt, Field(gt=0)]
@@ -2109,20 +2117,45 @@ def create_app(settings: Settings) -> ASGIApp:
             )
         )
 
-    @scoped_tool(name="anki_media_store", scope="write")
     async def media_store(
         filename: MediaFilename,
-        content_base64: MediaContent,
+        content_base64: MediaContent | None = None,
+        url: MediaUrl | None = None,
         idempotency_key: IdempotencyKey | None = None,
     ) -> dict[str, Any]:
-        """Create or replace one bounded media file from base64 content."""
+        if (content_base64 is None) == (url is None):
+            cause = ValueError("exactly one of content_base64 and url is required")
+            raise_tool_error("INVALID_ARGUMENT", str(cause), cause)
+        if url is None:
+            request = {"filename": filename, "content_base64": content_base64}
+        else:
+            request = {"filename": filename, "url": url}
+            try:
+                check_media_filename(filename)
+                content = await asyncio.to_thread(
+                    download_media, url, settings.media_url_hosts, settings.max_media_bytes
+                )
+            except MediaDownloadError as exc:
+                raise_tool_error(exc.code, str(exc), exc)
+            content_base64 = base64.b64encode(content).decode("ascii")
         return await mutate(
             "anki_media_store",
             idempotency_key,
-            {"filename": filename, "content_base64": content_base64},
-            lambda adapter: adapter.store_media(filename, content_base64),
+            request,
+            lambda adapter: adapter.store_media(filename, cast(str, content_base64)),
             sync_media=True,
         )
+
+    allowed_hosts = ", ".join(sorted(settings.media_url_hosts)) or "none"
+    media_store.__doc__ = (
+        "Create or replace one bounded media file from base64 content or an HTTPS URL.\n\n"
+        "Pass exactly one of content_base64 and url. Prefer url: the server downloads it, so "
+        f"the file never passes through the client. Allowed url hosts: {allowed_hosts}. "
+        "On cdn.jsdelivr.net and unpkg.com name an exact version (pkg@1.2.3); on "
+        "raw.githubusercontent.com and jsdelivr /gh/ name a full commit hash. A url store's "
+        f"filename must end in one of: {', '.join(sorted(URL_MEDIA_EXTENSIONS))}."
+    )
+    scoped_tool(name="anki_media_store", scope="write")(media_store)
 
     @scoped_tool(name="anki_media_rename", scope="write")
     async def media_rename(
