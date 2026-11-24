@@ -110,7 +110,7 @@ internet-facing server exposes.
 | `MCP_PUBLIC_URL` | required in `builtin` mode | Public HTTPS origin of the server, such as `https://anki.example.com`. It is used as the OAuth issuer. HTTP is accepted only for loopback hosts. |
 | `MCP_OAUTH_PASSWORD_HASH` | required alternative in `builtin` mode | Owner password hash from `anki-mcp-hash-password`. Use exactly one of this setting and `MCP_OAUTH_PASSWORD_HASH_FILE`. |
 | `MCP_OAUTH_PASSWORD_HASH_FILE` | required alternative in `builtin` mode | Path to a file containing the password hash. |
-| `MCP_OAUTH_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback` | Comma-separated redirect URIs that clients may register. A client asking for any other redirect URI is refused, so a stranger cannot register a client that sends your authorization code to their own site. |
+| `MCP_OAUTH_REDIRECT_URIS` | `https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback` | Comma-separated redirect URIs that clients may register. Loopback redirect URIs (`http://localhost`, `http://127.0.0.1` or `http://[::1]` with a port) are always accepted, so local clients such as Claude Code connect without being listed: the authorization code goes only to the machine that signed in, and PKCE stops anyone else from redeeming it. A client asking for any other redirect URI is refused, so a stranger cannot register a client that sends your authorization code to their own site. |
 
 ### Collection and synchronization
 

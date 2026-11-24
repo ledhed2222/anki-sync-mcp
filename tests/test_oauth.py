@@ -110,6 +110,35 @@ def test_builtin_mode_requires_https_public_url_and_hash(
         Settings(_env_file=None)
 
 
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "http://localhost:33418/callback",
+        "http://127.0.0.1:51234/callback",
+        "http://[::1]:8080/",
+    ],
+)
+def test_loopback_redirect_registers_on_any_port(client: TestClient, uri: str) -> None:
+    response = client.post("/register", json={"redirect_uris": [uri]})
+    assert response.status_code == 201, response.text
+
+
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "https://localhost:33418/callback",
+        "http://localhost.evil.example/callback",
+        "http://localhost@evil.example/callback",
+        "http://user@localhost:33418/callback",
+        "http://10.0.0.1:33418/callback",
+        "http://localhost/callback",
+    ],
+)
+def test_non_loopback_redirect_is_refused(client: TestClient, uri: str) -> None:
+    response = client.post("/register", json={"redirect_uris": [REDIRECT, uri]})
+    assert response.status_code == 400, response.text
+
+
 def test_full_flow_and_rejections(client: TestClient, caplog: pytest.LogCaptureFixture) -> None:
     assert client.post("/mcp", json=INITIALIZE).status_code == 401
     assert _mcp(client, "not-a-token") == 401
