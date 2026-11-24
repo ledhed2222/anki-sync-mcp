@@ -55,6 +55,8 @@ async def test_general_note_workflows_validate_fields_duplicates_and_tags(
         )
         found = await service.search_notes("tag:phase-one", offset=0, limit=10)
         note = await service.get_note(created["note_id"])
+        full = await service.search_notes("tag:phase-one", offset=0, limit=10, include_fields=True)
+        assert full["items"] == [note]
         updated = await service.update_note_fields(created["note_id"], {"Back": "changed"})
         tagged = await service.add_note_tags([created["note_id"]], ["durable"])
         untagged = await service.remove_note_tags([created["note_id"]], ["MCP"])

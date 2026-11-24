@@ -635,14 +635,32 @@ def create_app(settings: Settings) -> ASGIApp:
             )
         raise ToolError(json.dumps(payload, separators=(",", ":"))) from cause
 
+    def encoded_size(value: Any) -> int:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    def fit_page(result: dict[str, Any]) -> dict[str, Any]:
+        """Drop trailing items so the page fits MCP_MAX_RESPONSE_BYTES, keeping at least one."""
+        items = result["items"]
+        size = encoded_size({**result, "items": []})
+        kept = 0
+        for item in items:
+            # +1 for the separating comma; overcounts by one, which errs on the safe side.
+            size += encoded_size(item) + 1
+            if kept and size > settings.max_response_bytes:
+                break
+            kept += 1
+        if kept < len(items):
+            # limit shrinks too, so clients that page by offset + limit stay correct.
+            result.update(items=items[:kept], limit=kept, has_more=True)
+        return result
+
     async def execute(
         operation: Awaitable[T], receipt: Callable[[T], dict[str, Any]] | None = None
     ) -> T | dict[str, Any]:
         try:
             raw_result = await operation
             result = receipt(raw_result) if receipt is not None else raw_result
-            encoded = json.dumps(result, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            if len(encoded) > settings.max_response_bytes:
+            if encoded_size(result) > settings.max_response_bytes:
                 raise ResponseTooLargeError("tool response exceeds MCP_MAX_RESPONSE_BYTES")
             return result
         except DuplicateNoteError as exc:
@@ -1316,12 +1334,21 @@ def create_app(settings: Settings) -> ASGIApp:
         query: SearchQuery = "",
         offset: Offset = 0,
         limit: PageLimit = settings.max_page_size,
+        include_fields: StrictBool = False,
         sync_before: SyncMedia = False,
     ) -> dict[str, Any]:
-        """Search notes with Anki search syntax and bounded offset pagination."""
+        """Search notes with Anki search syntax and bounded offset pagination.
+
+        With include_fields, each item is the full note as anki_notes_get returns it. A page
+        that would exceed MCP_MAX_RESPONSE_BYTES returns fewer items, with limit set to the
+        count returned and has_more true.
+        """
         return await execute(
             service.coordinated_read(
-                lambda adapter: adapter.search_notes(query, offset, limit), sync_before
+                lambda adapter: fit_page(
+                    adapter.search_notes(query, offset, limit, include_fields)
+                ),
+                sync_before,
             )
         )
 

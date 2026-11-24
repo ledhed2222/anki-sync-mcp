@@ -326,6 +326,7 @@ def test_note_and_card_control_tools_return_durable_receipts(
             {"card_ids": [card_id], "idempotency_key": "protocol-unsuspend-key"},
         )
         fetched = call("anki_notes_get", {"note_id": note_id})
+        searched = call("anki_notes_search", {"query": f"nid:{note_id}", "include_fields": True})
         batch_args: dict[str, object] = {
             "notes": [
                 {
@@ -341,6 +342,7 @@ def test_note_and_card_control_tools_return_durable_receipts(
         batch = call("anki_notes_create_batch", batch_args)
         batch_replayed = call("anki_notes_create_batch", batch_args)
 
+    assert searched["items"] == [fetched]
     assert repeated == created
     assert batch_replayed == batch
     assert [item["status"] for item in batch["result"]["notes"]] == [
@@ -357,6 +359,68 @@ def test_note_and_card_control_tools_return_durable_receipts(
     assert unsuspended["result"]["suspended"] is False
     assert "durable" in fetched["tags"]
     assert {field["name"]: field["value"] for field in fetched["fields"]}["Back"] == "updated"
+
+
+def test_notes_search_returns_fewer_items_to_fit_the_response_limit(
+    phase_settings: Settings,
+) -> None:
+    collection = Collection(str(phase_settings.collection_path))
+    try:
+        deck_id = collection.decks.id_for_name("Study")
+        model = collection.models.by_name("Basic")
+        assert deck_id is not None and model is not None
+        for index in range(3):
+            note = collection.new_note(model)
+            note["Front"] = f"big {index}"
+            note["Back"] = "x" * 3000
+            note.tags = ["big"]
+            collection.add_note(note, deck_id)
+    finally:
+        collection.close()
+    settings = phase_settings.model_copy(
+        update={"max_rendered_field_bytes": 4000, "max_response_bytes": 8100}
+    )
+
+    with TestClient(create_app(settings)) as client:
+        headers = {
+            "Authorization": "Bearer phase-token",
+            "Accept": "application/json, text/event-stream",
+        }
+        initialized = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+        response = client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "anki_notes_search",
+                    "arguments": {"query": "tag:big", "include_fields": True},
+                },
+            },
+        )
+    result = response.json()["result"]
+    assert result.get("isError") is not True, result
+    page = json.loads(result["content"][0]["text"])
+    assert len(page["items"]) == 2
+    assert page["limit"] == 2
+    assert page["has_more"] is True
+    assert page["total"] == 3
 
 
 def test_status_backup_and_readiness_are_actionable(phase_settings: Settings) -> None:
