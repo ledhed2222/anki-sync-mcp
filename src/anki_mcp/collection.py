@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from anki.cards import CardId
     from anki.decks import DeckConfigId, DeckId
     from anki.models import NotetypeId
-    from anki.notes import NoteId
+    from anki.notes import Note, NoteId
 
 T = TypeVar("T")
 AUDIT_LOGGER = logging.getLogger("anki_mcp.audit")
@@ -1720,23 +1720,29 @@ class CollectionAdapter:
         except NotFoundError as exc:
             raise LookupError(f"note {note_id} not found") from exc
         first_field, first_field_truncated = self._truncate_rendered(note.fields[0])
+        model_name, model_name_truncated = self._note_type_name(note)
         return {
             "id": int(note.id),
             "note_type_id": int(note.mid),
+            "note_type_name": model_name,
+            "note_type_name_truncated": model_name_truncated,
             "first_field": first_field,
             "first_field_truncated": first_field_truncated,
             "tags": list(note.tags),
         }
+
+    def _note_type_name(self, note: Note) -> tuple[str, bool]:
+        model = self.collection.models.get(note.mid)
+        if model is None:  # pragma: no cover - Anki preserves referenced note types
+            raise LookupError(f"note type for note {int(note.id)} not found")
+        return self._truncate_rendered(str(model["name"]))
 
     def get_note(self, note_id: int) -> dict[str, Any]:
         try:
             note = self.collection.get_note(cast("NoteId", note_id))
         except NotFoundError as exc:
             raise LookupError(f"note {note_id} not found") from exc
-        model = self.collection.models.get(note.mid)
-        if model is None:  # pragma: no cover - Anki preserves referenced note types
-            raise LookupError(f"note type for note {note_id} not found")
-        model_name, model_name_truncated = self._truncate_rendered(str(model["name"]))
+        model_name, model_name_truncated = self._note_type_name(note)
         fields: list[dict[str, Any]] = []
         note_items = note.items()
         for name, value in note_items[: self.max_card_fields]:
