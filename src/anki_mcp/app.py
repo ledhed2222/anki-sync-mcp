@@ -1357,9 +1357,10 @@ def create_app(settings: Settings) -> ASGIApp:
     ) -> dict[str, Any]:
         """Search notes with Anki search syntax and bounded offset pagination.
 
-        With include_fields, each item is the full note as anki_notes_get returns it. A page
-        that would exceed MCP_MAX_RESPONSE_BYTES returns fewer items, with limit set to the
-        count returned and has_more true.
+        Each item names its note type (note_type_id, note_type_name). With include_fields,
+        each item is the full note as anki_notes_get returns it. A page that would exceed
+        MCP_MAX_RESPONSE_BYTES returns fewer items, with limit set to the count returned
+        and has_more true.
         """
         return await execute(
             service.coordinated_read(

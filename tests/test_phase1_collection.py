@@ -80,6 +80,8 @@ async def test_general_note_workflows_validate_fields_duplicates_and_tags(
             await service.update_note_fields(created["note_id"], {"Missing": "x"})
 
     assert found["items"][0]["id"] == created["note_id"]
+    assert found["items"][0]["note_type_name"] == note["note_type_name"] == "Basic"
+    assert found["items"][0]["note_type_name_truncated"] is False
     assert note["note_type_id"] == model_id
     assert note["card_ids"] == created["card_ids"]
     assert {item["name"]: item["value"] for item in note["fields"]} == {
