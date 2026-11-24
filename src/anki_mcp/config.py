@@ -62,9 +62,11 @@ def validate_sync_migration_endpoint(value: str, configured_endpoint: str | None
 
 
 # Public static-content hosts: npm/GitHub CDNs (Fontsource fonts), Google Fonts files and
-# Wikipedia/Wikimedia Commons media.
+# Wikipedia/Wikimedia Commons media. commons.wikimedia.org serves Special:FilePath URLs, which
+# name a file by its Commons title and redirect to the file on upload.wikimedia.org.
 _DEFAULT_MEDIA_URL_HOSTS = (
     "cdn.jsdelivr.net",
+    "commons.wikimedia.org",
     "fonts.gstatic.com",
     "raw.githubusercontent.com",
     "unpkg.com",

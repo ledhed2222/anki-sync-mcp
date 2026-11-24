@@ -45,6 +45,7 @@ def test_direct_token_and_defaults(tmp_path: Path) -> None:
     assert settings.max_card_fields == 100
     assert settings.max_media_bytes == 1_048_576
     assert "upload.wikimedia.org" in settings.media_url_hosts
+    assert "commons.wikimedia.org" in settings.media_url_hosts
     assert "cdn.jsdelivr.net" in settings.media_url_hosts
     assert settings.sync_timeout_seconds == 300
     assert settings.media_sync_wait_seconds == 10
