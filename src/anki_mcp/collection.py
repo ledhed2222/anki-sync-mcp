@@ -2506,10 +2506,6 @@ class CollectionAdapter:
         response = self.collection.media.check()
         missing = sorted((str(name) for name in response.missing), key=str.casefold)
         unused = sorted((str(name) for name in response.unused), key=str.casefold)
-        if len(missing) > self.max_search_scan or len(unused) > self.max_search_scan:
-            raise ValueError(
-                "media check exceeds MCP_MAX_SEARCH_SCAN; use a larger configured bound"
-            )
         return {
             "missing": missing[offset : offset + limit],
             "unused": unused[offset : offset + limit],
@@ -2549,8 +2545,10 @@ class CollectionAdapter:
         deck = self.collection.decks.get(card.did, default=False)
         if deck is None:
             raise LookupError(f"deck for card {card_id} not found")
-        question, question_truncated = self._truncate_rendered(card.question())
-        answer, answer_truncated = self._truncate_rendered(card.answer())
+        # The note type's CSS is left out; anki_note_types_get returns it.
+        rendered = card.render_output()
+        question, question_truncated = self._truncate_rendered(rendered.question_text)
+        answer, answer_truncated = self._truncate_rendered(rendered.answer_text)
         deck_name, deck_name_truncated = self._truncate_rendered(str(deck["name"]))
         note = card.note()
         fields: list[dict[str, Any]] = []

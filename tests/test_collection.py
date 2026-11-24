@@ -84,6 +84,8 @@ async def test_searches_and_gets_cards(populated_collection: str) -> None:
     assert card["deck_name"] == "Languages::Spanish"
     assert card["question"]
     assert card["answer"]
+    assert "<style>" not in card["question"]
+    assert "<style>" not in card["answer"]
 
 
 @pytest.mark.anyio
@@ -114,10 +116,10 @@ async def test_rendered_card_fields_are_bounded(populated_collection: str) -> No
         card = await service.get_card(search["items"][0]["id"])
         created = await service.create_card(card["deck_id"], "x" * 1000, "y" * 1000)
         created_card = await service.get_card(created["id"])
-    assert len(card["question"].encode("utf-8")) <= 64
-    assert len(card["answer"].encode("utf-8")) <= 64
-    assert card["question_truncated"] is True
-    assert card["answer_truncated"] is True
+    assert len(created_card["question"].encode("utf-8")) <= 64
+    assert len(created_card["answer"].encode("utf-8")) <= 64
+    assert created_card["question_truncated"] is True
+    assert created_card["answer_truncated"] is True
     assert all(len(field["value"].encode("utf-8")) <= 64 for field in created_card["fields"])
     assert len(created_card["fields"]) == 1
     assert created_card["fields_omitted"] == 1
