@@ -16,7 +16,13 @@ from anki_mcp.media_url import (
 )
 
 HOSTS = frozenset(
-    {"cdn.jsdelivr.net", "unpkg.com", "raw.githubusercontent.com", "upload.wikimedia.org"}
+    {
+        "cdn.jsdelivr.net",
+        "unpkg.com",
+        "raw.githubusercontent.com",
+        "upload.wikimedia.org",
+        "commons.wikimedia.org",
+    }
 )
 COMMIT = "0123456789abcdef0123456789abcdef01234567"
 PINNED = "https://cdn.jsdelivr.net/npm/x@1.0.0/a"
@@ -71,6 +77,7 @@ def test_accepts_listed_host_case_insensitively() -> None:
         "https://unpkg.com/@fontsource/inter@5.0.8/files/a.woff2",
         f"https://raw.githubusercontent.com/owner/repo/{COMMIT}/a.png",
         "https://upload.wikimedia.org/wikipedia/commons/4/47/PNG_transparency.png",
+        "https://commons.wikimedia.org/wiki/Special:FilePath/PNG_transparency.png?width=960",
     ],
 )
 def test_pinned_urls_are_accepted(url: str) -> None:
@@ -152,3 +159,15 @@ def test_download_failures_have_their_own_codes(
     with pytest.raises(MediaDownloadError) as caught:
         download_media(PINNED, HOSTS, 5)
     assert caught.value.code == code
+
+
+def test_commons_file_path_redirect_to_upload_host_is_followed() -> None:
+    handler = media_url._AllowListRedirectHandler(HOSTS)
+    request = urllib.request.Request(
+        "https://commons.wikimedia.org/wiki/Special:FilePath/PNG_transparency.png?width=960"
+    )
+    target = (
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency.png/"
+        "960px-PNG_transparency.png"
+    )
+    assert handler.redirect_request(request, None, 302, "Found", {}, target)
