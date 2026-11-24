@@ -1,8 +1,7 @@
-"""Built-in OAuth authorization server for MCP_AUTH_MODE=builtin.
+"""Built-in OAuth authorization server.
 
-Lets OAuth-only clients, such as claude.ai custom connectors, connect to a single-owner server.
-The owner signs in with a password, and the MCP SDK provides the OAuth endpoints. Also provides
-the anki-mcp-hash-password command.
+Every MCP client signs in as a user from the users file, with that user's password, and the MCP
+SDK provides the OAuth endpoints. Also provides the anki-mcp-hash-password command.
 """
 
 from __future__ import annotations
@@ -17,7 +16,6 @@ import logging
 import secrets
 import sys
 import time
-from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -33,11 +31,13 @@ from mcp.server.auth.provider import (
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse, Response
+from starlette.responses import RedirectResponse, Response
 from starlette.routing import Route
 
 from anki_mcp.config import Settings
+from anki_mcp.pages import page
 from anki_mcp.state import PersistentState
+from anki_mcp.users import UserStore
 
 _LOGGER = logging.getLogger(__name__)
 _ACCESS_TOKEN_SECONDS = 3600
@@ -102,29 +102,35 @@ def _is_loopback_redirect(uri: str) -> bool:
     )
 
 
+class _Code(AuthorizationCode):
+    subject: str | None = None
+
+
 def _token_key(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 class BuiltinOAuthProvider:
-    """Single-owner OAuth authorization server: password login, DCR, rotating refresh tokens.
+    """OAuth authorization server: password login, DCR, rotating refresh tokens.
 
-    Tokens are persisted only as SHA-256 hashes, so a leaked state file grants nothing.
+    People sign in with a user id and password, and every token carries that user id as its
+    subject. Tokens are persisted only as SHA-256 hashes, so a leaked state file grants nothing.
     """
 
-    def __init__(self, settings: Settings) -> None:
-        assert settings.oauth_password_hash is not None
-        self._password_hash = settings.oauth_password_hash.get_secret_value()
+    def __init__(self, settings: Settings, users: UserStore) -> None:
+        self._users = users
+        # Unknown user ids are checked against this so a failed login costs the same either way.
+        self._decoy_hash = hash_password(secrets.token_urlsafe(32))
         self._public_url = settings.public_url
         self._redirect_uris = settings.oauth_redirect_uris
         self.scopes = sorted(settings.scopes)
-        self._path = Path(settings.collection_path).parent / "state" / "oauth.json"
+        self._path = settings.data_dir / "oauth.json"
         self._path.parent.mkdir(parents=True, exist_ok=True)
         stored = PersistentState._load_json(self._path) or {}
         self._clients: dict[str, dict[str, Any]] = stored.get("clients", {})
         self._access: dict[str, dict[str, Any]] = stored.get("access", {})
         self._refresh: dict[str, dict[str, Any]] = stored.get("refresh", {})
-        self._codes: dict[str, AuthorizationCode] = {}
+        self._codes: dict[str, _Code] = {}
         self._pending: dict[str, tuple[float, str, AuthorizationParams]] = {}
         self._login_lock = asyncio.Lock()
 
@@ -184,9 +190,10 @@ class BuiltinOAuthProvider:
     async def exchange_authorization_code(
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
-        if self._codes.pop(authorization_code.code, None) is None:
+        code = self._codes.pop(authorization_code.code, None)
+        if code is None:
             raise TokenError("invalid_grant", "authorization code already used")
-        return self._issue(authorization_code.client_id, authorization_code.scopes)
+        return self._issue(code.client_id, code.scopes, code.subject)
 
     async def load_refresh_token(
         self, client: OAuthClientInformationFull, refresh_token: str
@@ -194,7 +201,7 @@ class BuiltinOAuthProvider:
         stored = self._refresh.get(_token_key(refresh_token))
         if stored is None or stored["client_id"] != client.client_id:
             return None
-        if stored["expires_at"] <= time.time():
+        if stored["expires_at"] <= time.time() or not self._subject_allowed(stored):
             return None
         return RefreshToken(
             token=refresh_token,
@@ -213,18 +220,26 @@ class BuiltinOAuthProvider:
         if stored is None:
             raise TokenError("invalid_grant", "refresh token already used")
         self._access.pop(stored["access_key"], None)
-        return self._issue(refresh_token.client_id, scopes)
+        return self._issue(refresh_token.client_id, scopes, stored.get("subject"))
 
     async def load_access_token(self, token: str) -> AccessToken | None:
         stored = self._access.get(_token_key(token))
         if stored is None or stored["expires_at"] <= time.time():
+            return None
+        if not self._subject_allowed(stored):
             return None
         return AccessToken(
             token=token,
             client_id=stored["client_id"],
             scopes=stored["scopes"],
             expires_at=stored["expires_at"],
+            subject=stored.get("subject"),
         )
+
+    def _subject_allowed(self, stored: dict[str, Any]) -> bool:
+        """A token is only good while its user still exists."""
+        subject = stored.get("subject")
+        return subject is not None and self._users.get(subject) is not None
 
     async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
         key = _token_key(token.token)
@@ -236,7 +251,7 @@ class BuiltinOAuthProvider:
             self._access.pop(refresh["access_key"], None)
         self._save()
 
-    def _issue(self, client_id: str, scopes: list[str]) -> OAuthToken:
+    def _issue(self, client_id: str, scopes: list[str], subject: str | None) -> OAuthToken:
         now = int(time.time())
         access_token = secrets.token_urlsafe(32)
         refresh_token = secrets.token_urlsafe(32)
@@ -246,12 +261,14 @@ class BuiltinOAuthProvider:
             "scopes": scopes,
             "expires_at": now + _ACCESS_TOKEN_SECONDS,
             "refresh_key": refresh_key,
+            "subject": subject,
         }
         self._refresh[refresh_key] = {
             "client_id": client_id,
             "scopes": scopes,
             "expires_at": now + _REFRESH_TOKEN_SECONDS,
             "access_key": access_key,
+            "subject": subject,
         }
         self._save()
         return OAuthToken(
@@ -262,24 +279,35 @@ class BuiltinOAuthProvider:
             refresh_token=refresh_token,
         )
 
-    def _login_page(self, request_id: str, message: str = "", status: int = 200) -> Response:
+    def _login_page(
+        self, request_id: str, message: str = "", status: int = 200, username: str = ""
+    ) -> Response:
         pending = self._pending.get(request_id)
         if pending is None or pending[0] <= time.time():
-            return _html("<p>This sign-in request has expired. Start again from your app.</p>", 400)
+            return page(
+                "Sign-in expired",
+                "<h1>Sign-in expired</h1><p>This sign-in request has expired. "
+                "Start again from your app.</p>",
+                400,
+            )
         _, client_id, params = pending
         client = self._clients.get(client_id, {})
         name = html.escape(str(client.get("client_name") or client_id))
         target = html.escape(urlsplit(str(params.redirect_uri)).netloc)
-        error = f"<p role='alert'><strong>{html.escape(message)}</strong></p>" if message else ""
-        return _html(
+        error = f"<p class='alert' role='alert'>{html.escape(message)}</p>" if message else ""
+        return page(
+            "Sign in",
             f"<h1>Sign in to Anki MCP</h1>"
-            f"<p><strong>{name}</strong> is asking for access to your Anki collection. "
-            f"You will be sent back to <strong>{target}</strong>.</p>{error}"
-            f"<form method='post'>"
+            f"<p><strong>{name}</strong> is asking for access to your Anki collection.</p>"
+            f"{error}<form method='post'>"
             f"<input type='hidden' name='request' value='{html.escape(request_id)}'>"
-            f"<label>Password <input type='password' name='password' autofocus required "
-            f"autocomplete='current-password'></label> <button type='submit'>Allow</button>"
-            f"</form>",
+            f"<label>User <input name='username' value='{html.escape(username)}' "
+            f"autocomplete='username' autocapitalize='none' spellcheck='false' required "
+            f"{'' if username else 'autofocus'}></label>"
+            f"<label>Password <input type='password' name='password' required "
+            f"autocomplete='current-password' {'autofocus' if username else ''}></label>"
+            f"<button type='submit'>Allow access</button></form>"
+            f"<p class='muted after'>You will be sent back to {target}.</p>",
             status,
         )
 
@@ -288,18 +316,25 @@ class BuiltinOAuthProvider:
             return self._login_page(request.query_params.get("request", ""))
         form = await request.form()
         request_id = str(form.get("request", ""))
+        username = str(form.get("username", ""))
         password = str(form.get("password", ""))
+        user = self._users.get(username)
+        stored_hash = user.password_hash if user is not None else None
+        known = stored_hash is not None
+        password_hash = stored_hash or self._decoy_hash
         async with self._login_lock:
             pending = self._pending.get(request_id)
             if pending is None or pending[0] <= time.time():
                 return self._login_page(request_id)
-            valid = await asyncio.to_thread(verify_password, password, self._password_hash)
-            if not valid:
+            valid = await asyncio.to_thread(verify_password, password, password_hash)
+            if not (valid and known):
                 await asyncio.sleep(_FAILED_LOGIN_DELAY_SECONDS)
-                return self._login_page(request_id, "Wrong password.", 401)
+                return self._login_page(request_id, "Wrong user or password.", 401, username)
             _, client_id, params = self._pending.pop(request_id)
+        subject = username
         code = secrets.token_urlsafe(32)
-        self._codes[code] = AuthorizationCode(
+        self._codes[code] = _Code(
+            subject=subject,
             code=code,
             scopes=params.scopes or self.scopes,
             expires_at=time.time() + _AUTHORIZATION_CODE_SECONDS,
@@ -316,21 +351,6 @@ class BuiltinOAuthProvider:
 
     def routes(self) -> list[Route]:
         return [Route(_LOGIN_PATH, self.login, methods=["GET", "POST"])]
-
-
-def _html(body: str, status: int) -> HTMLResponse:
-    return HTMLResponse(
-        f"<!doctype html><html><head><meta charset='utf-8'>"
-        f"<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        f"<title>Anki MCP</title></head><body>{body}</body></html>",
-        status_code=status,
-        headers={
-            "Cache-Control": "no-store",
-            "X-Frame-Options": "DENY",
-            "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
-            "Referrer-Policy": "no-referrer",
-        },
-    )
 
 
 def main() -> None:

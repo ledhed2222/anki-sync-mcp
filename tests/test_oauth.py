@@ -8,7 +8,8 @@ from collections.abc import Iterator
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
-from anki.collection import Collection
+from conftest import OWNER_PASSWORD as PASSWORD
+from conftest import use_owner
 from pydantic import ValidationError
 from starlette.testclient import TestClient
 
@@ -17,7 +18,6 @@ from anki_mcp.app import create_app
 from anki_mcp.config import Settings
 
 REDIRECT = "https://claude.ai/api/mcp/auth_callback"
-PASSWORD = "correct horse battery"
 INITIALIZE = {
     "jsonrpc": "2.0",
     "id": 1,
@@ -30,21 +30,11 @@ INITIALIZE = {
 }
 
 
-@pytest.fixture(scope="module")
-def password_hash() -> str:
-    return oauth.hash_password(PASSWORD)
-
-
 @pytest.fixture
-def settings(monkeypatch: pytest.MonkeyPatch, tmp_path, password_hash: str) -> Settings:
-    collection_path = tmp_path / "collection.anki2"
-    Collection(str(collection_path)).close()
+def settings(monkeypatch: pytest.MonkeyPatch, tmp_path) -> Settings:
     monkeypatch.setattr(oauth, "_FAILED_LOGIN_DELAY_SECONDS", 0)
-    monkeypatch.setenv("ANKI_COLLECTION_PATH", str(collection_path))
+    use_owner(monkeypatch, tmp_path, "unused-token")
     monkeypatch.setenv("ANKI_SYNC_ON_WRITE", "false")
-    monkeypatch.setenv("MCP_AUTH_MODE", "builtin")
-    monkeypatch.setenv("MCP_PUBLIC_URL", "http://localhost")
-    monkeypatch.setenv("MCP_OAUTH_PASSWORD_HASH", password_hash)
     monkeypatch.setenv("MCP_SCOPES", "read,write")
     return Settings(_env_file=None)
 
@@ -64,6 +54,10 @@ def _mcp(client: TestClient, token: str) -> int:
         },
         json=INITIALIZE,
     ).status_code
+
+
+def _sign_in(request_id: str, password: str = PASSWORD) -> dict[str, str]:
+    return {"request": request_id, "username": "owner", "password": password}
 
 
 def _register(client: TestClient) -> tuple[str, str]:
@@ -96,16 +90,13 @@ def test_password_hash_round_trip() -> None:
     assert not oauth.verify_password("secret-password", "garbage")
 
 
-def test_builtin_mode_requires_https_public_url_and_hash(
-    monkeypatch: pytest.MonkeyPatch, password_hash: str
-) -> None:
-    monkeypatch.setenv("MCP_AUTH_MODE", "builtin")
-    monkeypatch.setenv("MCP_OAUTH_PASSWORD_HASH", password_hash)
+def test_public_url_must_be_https_except_on_loopback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MCP_PUBLIC_URL", "http://anki.example.com")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
     monkeypatch.setenv("MCP_PUBLIC_URL", "https://anki.example.com")
-    monkeypatch.delenv("MCP_OAUTH_PASSWORD_HASH")
+    assert Settings(_env_file=None).public_url == "https://anki.example.com"
+    monkeypatch.delenv("MCP_PUBLIC_URL")
     with pytest.raises(ValidationError):
         Settings(_env_file=None)
 
@@ -163,15 +154,15 @@ def test_full_flow_and_rejections(client: TestClient, caplog: pytest.LogCaptureF
     assert "Claude" in page.text
     assert page.headers["x-frame-options"] == "DENY"
 
-    wrong = client.post(login.path, data={"request": request_id, "password": "nope"})
+    wrong = client.post(login.path, data=_sign_in(request_id, "nope"))
     assert wrong.status_code == 401
-    right = client.post(login.path, data={"request": request_id, "password": PASSWORD})
+    right = client.post(login.path, data=_sign_in(request_id))
     assert right.status_code == 303
     callback = urlsplit(right.headers["location"])
     assert f"{callback.scheme}://{callback.netloc}{callback.path}" == REDIRECT
     query = parse_qs(callback.query)
     assert query["state"] == ["xyz"]
-    replay = client.post(login.path, data={"request": request_id, "password": PASSWORD})
+    replay = client.post(login.path, data=_sign_in(request_id))
     assert replay.status_code == 400
 
     token_request = {
@@ -222,7 +213,7 @@ def test_tokens_survive_restart(settings: Settings) -> None:
         )
         login = urlsplit(_login_url(first, client_id, challenge))
         request_id = parse_qs(login.query)["request"][0]
-        callback = first.post(login.path, data={"request": request_id, "password": PASSWORD})
+        callback = first.post(login.path, data=_sign_in(request_id))
         code = parse_qs(urlsplit(callback.headers["location"]).query)["code"][0]
         tokens = first.post(
             "/token",
@@ -235,7 +226,20 @@ def test_tokens_survive_restart(settings: Settings) -> None:
                 "code_verifier": verifier,
             },
         ).json()
-    state_file = settings.collection_path.parent / "state" / "oauth.json"
+    state_file = settings.data_dir / "oauth.json"
     assert tokens["access_token"] not in state_file.read_text()
     with TestClient(create_app(settings)) as second:
         assert _mcp(second, tokens["access_token"]) == 200
+
+
+def test_sign_in_page_stylesheet_is_allowed_by_its_security_policy(client: TestClient) -> None:
+    client_id, _ = _register(client)
+    login = urlsplit(_login_url(client, client_id, "c" * 43))
+    page = client.get(login.path, params={"request": parse_qs(login.query)["request"][0]})
+    style = page.text.split("<style>", 1)[1].split("</style>", 1)[0]
+    digest = base64.b64encode(hashlib.sha256(style.encode()).digest()).decode()
+    policy = page.headers["content-security-policy"]
+    assert f"style-src 'sha256-{digest}'" in policy
+    assert "unsafe-inline" not in policy
+    assert " style=" not in page.text
+    assert "name='username'" in page.text

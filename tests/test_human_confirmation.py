@@ -9,6 +9,7 @@ from typing import Any
 import anyio
 import pytest
 from anki.collection import Collection
+from conftest import owner_collection_path, use_owner
 from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import ElicitRequestParams, ElicitResult, ErrorData
@@ -22,7 +23,7 @@ _Callback = Callable[[Any, ElicitRequestParams], Awaitable[ElicitResult | ErrorD
 
 @pytest.fixture
 def collection_path(tmp_path: Path) -> Path:
-    path = tmp_path / "collection.anki2"
+    path = owner_collection_path(tmp_path)
     collection = Collection(str(path))
     try:
         deck_id = collection.decks.id("Charter")
@@ -45,8 +46,9 @@ async def _client(
     scopes: str = "read,write,admin,destructive",
     elicitation: _Callback | None = None,
 ) -> AsyncIterator[ClientSession]:
-    monkeypatch.setenv("MCP_AUTH_TOKEN", "confirmation-token")
-    monkeypatch.setenv("ANKI_COLLECTION_PATH", str(collection_path))
+    use_owner(monkeypatch, collection_path.parents[2], "confirmation-token")
+    # The in-memory session carries no HTTP request, so stand in for the signed-in user.
+    monkeypatch.setattr(app_module, "_authenticated_subject", lambda _: "owner")
     monkeypatch.setenv("ANKI_SYNC_ON_WRITE", "false")
     monkeypatch.setenv("MCP_SCOPES", scopes)
     monkeypatch.setenv("ANKI_ALLOW_DESTRUCTIVE", "true")
@@ -57,13 +59,13 @@ async def _client(
     app: Any = create_app(Settings(_env_file=None))
     while not hasattr(app, "state"):
         app = app.app
-    async with (
-        app.state.collection_service,
-        create_connected_server_and_client_session(
+    try:
+        async with create_connected_server_and_client_session(
             app.state.mcp, elicitation_callback=elicitation
-        ) as session,
-    ):
-        yield session
+        ) as session:
+            yield session
+    finally:
+        await app.state.collection_registry.close_all()
 
 
 async def _call(session: ClientSession, name: str, arguments: dict[str, Any]) -> Any:

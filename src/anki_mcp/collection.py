@@ -182,6 +182,7 @@ class CollectionAdapter:
         sync_on_write: bool = False,
         media_sync_wait_seconds: float = 10,
         initial_media_sync: bool = False,
+        backup_folder: Path | None = None,
     ) -> None:
         if anki.lang.current_i18n is None:
             anki.lang.set_lang("en_US")
@@ -206,7 +207,7 @@ class CollectionAdapter:
         self._media_sync_error: str | None = None
         self._media_progress_changed_at = time.monotonic()
         self._media_sync_started_at = time.monotonic()
-        self._backup_folder = Path(path).parent / "backups"
+        self._backup_folder = backup_folder or Path(path).parent / "backups"
         self._state = PersistentState(path)
         persisted_auth = self._state.load_sync_auth()
         self._sync_auth = (
@@ -236,6 +237,11 @@ class CollectionAdapter:
             self.collection.close()
         finally:
             self._state.close()
+
+    def media_sync_active(self) -> bool:
+        if self._media_sync_running:
+            self._poll_media_sync()
+        return self._media_sync_running
 
     def check_ready(self) -> bool:
         if self.collection.db is None:
@@ -3284,8 +3290,9 @@ class CollectionAdapter:
             }
             if progress != self._media_sync_progress:
                 self._media_sync_progress = progress
-                self._media_progress_changed_at = time.monotonic()
                 self._save_operational_status()
+                # Stamped after the fsync above, so a slow disk never counts as a stalled sync.
+                self._media_progress_changed_at = time.monotonic()
                 MEDIA_SYNC_LOGGER.debug(
                     "media sync progress checked=%s added=%s removed=%s active=%s elapsed=%.1fs",
                     progress["checked"],
@@ -3506,6 +3513,7 @@ class CollectionExecutor:
         sync_on_write: bool = False,
         media_sync_wait_seconds: float = 10,
         initial_media_sync: bool = False,
+        backup_folder: Path | None = None,
     ) -> None:
         self._path = path
         self._max_page_size = max_page_size
@@ -3519,6 +3527,7 @@ class CollectionExecutor:
         self._sync_on_write = sync_on_write
         self._media_sync_wait_seconds = media_sync_wait_seconds
         self._initial_media_sync = initial_media_sync
+        self._backup_folder = backup_folder
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
         self._adapter: CollectionAdapter | None = None
         self._worker_id: int | None = None
@@ -3544,6 +3553,7 @@ class CollectionExecutor:
                 self._sync_on_write,
                 self._media_sync_wait_seconds,
                 self._initial_media_sync,
+                self._backup_folder,
             )
 
         self._pool.submit(open_collection).result()
@@ -3585,6 +3595,7 @@ class AnkiCollectionService:
         sync_on_write: bool = False,
         media_sync_wait_seconds: float = 10,
         initial_media_sync: bool = False,
+        backup_folder: Path | None = None,
     ) -> None:
         self.executor = CollectionExecutor(
             path,
@@ -3599,6 +3610,7 @@ class AnkiCollectionService:
             sync_on_write,
             media_sync_wait_seconds,
             initial_media_sync,
+            backup_folder,
         )
 
     async def __aenter__(self) -> AnkiCollectionService:
@@ -4046,3 +4058,6 @@ class AnkiCollectionService:
 
     async def check_ready(self) -> bool:
         return await self.executor.run(lambda adapter: adapter.check_ready())
+
+    async def media_sync_active(self) -> bool:
+        return await self.executor.run(lambda adapter: adapter.media_sync_active())

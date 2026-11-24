@@ -14,7 +14,7 @@ def main() -> None:
     try:
         with urllib.request.urlopen(url, timeout=4) as response:  # noqa: S310 (fixed localhost)
             body = json.load(response)
-            if response.status != 200 or body != {"status": "ready"}:
+            if response.status != 200 or body.get("status") != "ready":
                 raise RuntimeError("service is not ready")
     except (OSError, ValueError, RuntimeError, urllib.error.URLError):
         sys.exit(1)
