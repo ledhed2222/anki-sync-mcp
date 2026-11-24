@@ -32,7 +32,7 @@ docker compose exec anki-mcp anki-mcp-healthcheck
 
 `anki-mcp-user add` prompts for the password you will sign in with. Point the reverse proxy at
 port 8000 of the `anki-mcp` container, forwarding `/mcp`, `/oauth/login`, `/authorize`,
-`/token`, `/register`, `/revoke` and `/.well-known/`. Then add `https://anki.example.com/mcp`
+`/token`, `/register`, `/revoke`, `/setup` and `/.well-known/`. Then add `https://anki.example.com/mcp`
 as a remote MCP server in your client. The client opens a sign-in page; enter your user id and
 password. Once connected, call `anki_sync_login` once; the sync host key is stored in the
 `anki_data` volume.
@@ -83,7 +83,12 @@ hashes, in `<ANKI_DATA_DIR>/oauth.json`.
 
 Manage accounts with `anki-mcp-user` (it reads `ANKI_DATA_DIR`, or takes `--file`):
 
-- `add <id>` prompts for the user's password. `--sync-username`, `--sync-host` (empty for
+- `invite <id> --email <address>` creates the user and emails them a setup link (see
+  [Invitations](#invitations)). `--sync-host` points them at a self-hosted sync server instead
+  of AnkiWeb; `--resend` sends a fresh link to someone who hasn't finished.
+- `reset <id>` emails a link that lets the user choose a new password. Their old password keeps
+  working until they use it.
+- `add <id>` creates a user directly and prompts for their password. `--sync-username`, `--sync-host` (empty for
   AnkiWeb) and `--sync-password` set their sync account; the sync password can be removed from
   the file once `anki_sync_login` has succeeded.
 - `passwd <id>` sets a new password. With `--hash`, it takes a line printed by
@@ -97,6 +102,36 @@ Changes take effect without a restart. User ids use `a-z`, `0-9`, `_` and `-`.
 
 A collection opens on its user's first call and closes after `ANKI_COLLECTION_IDLE_SECONDS`
 without one, so memory follows the number of active users, not registered ones.
+
+### Invitations
+
+`anki-mcp-user invite` sends the person a link to `/setup` on the server. It walks them through
+three pages:
+
+1. **Password.** They choose the password they will sign in with (at least 12 characters).
+2. **AnkiWeb.** They sign in to AnkiWeb, or the sync server named in the invite. The password is
+   used once and not stored; the server keeps only the login key AnkiWeb returns.
+3. **Copy.** Their collection downloads with a progress bar (a percentage while cards download,
+   then a running file count for media, whose total Anki does not know in advance). The page
+   refreshes itself; they can close it and return with the same link.
+
+They cannot sign in to an MCP client until the cards and all media have finished downloading.
+If the copy fails, the page explains why and offers a retry that resumes where it stopped.
+
+Links are single-use, stored only as hashes, and expire after `MCP_SETUP_LINK_HOURS`. A new
+link replaces the emailed one after the password step, so the email stops working once used.
+Email goes through your own mail server. Without `MCP_SMTP_HOST`, the command prints the link
+for you to send yourself.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `MCP_SMTP_HOST` | empty | Mail server for setup and reset links. Empty prints links instead of sending them. |
+| `MCP_SMTP_PORT` | `587` | Mail server port. |
+| `MCP_SMTP_SECURITY` | `starttls` | `starttls`, `tls` (implicit TLS, usually port 465), or `none`. `none` is refused unless the host is loopback, because a setup link is as good as a password. |
+| `MCP_SMTP_USERNAME` | empty | Mail server login, if it needs one. |
+| `MCP_SMTP_PASSWORD_FILE` | unset | Path to a file holding the mail server password. |
+| `MCP_SMTP_FROM` | required with `MCP_SMTP_HOST` | Sender address, such as `Anki MCP <anki@example.com>`. |
+| `MCP_SETUP_LINK_HOURS` | `72` | How long a setup or reset link stays valid (up to `720`). A copy that has started keeps its link until it finishes. |
 
 ### Collection, storage and synchronization
 

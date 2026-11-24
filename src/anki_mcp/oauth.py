@@ -322,6 +322,7 @@ class BuiltinOAuthProvider:
         stored_hash = user.password_hash if user is not None else None
         known = stored_hash is not None
         password_hash = stored_hash or self._decoy_hash
+        setup_unfinished = user is not None and not user.can_sign_in
         async with self._login_lock:
             pending = self._pending.get(request_id)
             if pending is None or pending[0] <= time.time():
@@ -330,6 +331,14 @@ class BuiltinOAuthProvider:
             if not (valid and known):
                 await asyncio.sleep(_FAILED_LOGIN_DELAY_SECONDS)
                 return self._login_page(request_id, "Wrong user or password.", 401, username)
+            if setup_unfinished:
+                return self._login_page(
+                    request_id,
+                    "Your account isn't ready yet. Finish setup from the link in your email, "
+                    "then try again.",
+                    403,
+                    username,
+                )
             _, client_id, params = self._pending.pop(request_id)
         subject = username
         code = secrets.token_urlsafe(32)

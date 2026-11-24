@@ -108,6 +108,13 @@ class Settings(BaseSettings):
     collection_idle_seconds: float = Field(
         900, ge=10, le=86_400, alias="ANKI_COLLECTION_IDLE_SECONDS"
     )
+    smtp_host: str = Field("", alias="MCP_SMTP_HOST")
+    smtp_port: int = Field(587, ge=1, le=65535, alias="MCP_SMTP_PORT")
+    smtp_security: Literal["starttls", "tls", "none"] = Field("starttls", alias="MCP_SMTP_SECURITY")
+    smtp_username: str = Field("", alias="MCP_SMTP_USERNAME")
+    smtp_password_file: Path | None = Field(None, alias="MCP_SMTP_PASSWORD_FILE")
+    smtp_from: str = Field("", alias="MCP_SMTP_FROM")
+    setup_link_hours: float = Field(72, gt=0, le=720, alias="MCP_SETUP_LINK_HOURS")
     media_root: Path | None = Field(None, alias="ANKI_MEDIA_ROOT")
     backup_root: Path | None = Field(None, alias="ANKI_BACKUP_ROOT")
     scopes_csv: str = Field("read,write,admin", alias="MCP_SCOPES")
@@ -191,6 +198,18 @@ class Settings(BaseSettings):
         self.public_url = f"{parsed.scheme}://{parsed.netloc}"
         if not self.oauth_redirect_uris:
             raise ValueError("MCP_OAUTH_REDIRECT_URIS must list at least one redirect URI")
+        return self
+
+    @model_validator(mode="after")
+    def validate_smtp(self) -> Self:
+        if not self.smtp_host:
+            return self
+        if not self.smtp_from:
+            raise ValueError("MCP_SMTP_FROM is required when MCP_SMTP_HOST is set")
+        loopback = self.smtp_host in {"localhost", "127.0.0.1", "::1"}
+        if self.smtp_security == "none" and not loopback:
+            # Setup links are as good as a password, so never send them unencrypted.
+            raise ValueError("MCP_SMTP_SECURITY=none is only allowed for a loopback MCP_SMTP_HOST")
         return self
 
     @property
