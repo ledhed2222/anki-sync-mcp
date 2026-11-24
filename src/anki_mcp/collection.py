@@ -2139,26 +2139,38 @@ class CollectionAdapter:
     def update_note_type(
         self,
         note_type_id: int,
-        name: str,
-        fields: list[str],
-        templates: list[dict[str, str]],
-        css: str,
+        name: str | None,
+        fields: list[str] | None,
+        templates: list[dict[str, str]] | None,
+        css: str | None,
     ) -> dict[str, Any]:
         model = self.collection.models.get(cast("NotetypeId", note_type_id))
         if model is None:
             raise LookupError(f"note type {note_type_id} not found")
-        if not name.strip():
-            raise ValueError("note type name must not be blank")
-        existing = self.collection.models.by_name(name)
-        if existing is not None and int(existing["id"]) != note_type_id:
-            raise ValueError(f"note type {name} already exists")
-        self._validate_note_type_parts(fields, templates)
+        if name is None and fields is None and templates is None and css is None:
+            raise ValueError("provide name, fields, templates, or css")
+        if name is not None:
+            if not name.strip():
+                raise ValueError("note type name must not be blank")
+            existing = self.collection.models.by_name(name)
+            if existing is not None and int(existing["id"]) != note_type_id:
+                raise ValueError(f"note type {name} already exists")
         current_fields = model.get("flds", [])
         current_templates = model.get("tmpls", [])
+        if fields is None:
+            fields = [field["name"] for field in current_fields]
+        if templates is None:
+            templates = [
+                {"name": t["name"], "question_format": t["qfmt"], "answer_format": t["afmt"]}
+                for t in current_templates
+            ]
+        self._validate_note_type_parts(fields, templates)
         if len(fields) != len(current_fields) or len(templates) != len(current_templates):
             raise ValueError("note type update must preserve field and template counts")
-        model["name"] = name
-        model["css"] = css
+        if name is not None:
+            model["name"] = name
+        if css is not None:
+            model["css"] = css
         for field, field_name in zip(current_fields, fields, strict=True):
             field["name"] = field_name
         for template, template_input in zip(current_templates, templates, strict=True):
@@ -3794,10 +3806,10 @@ class AnkiCollectionService:
     async def update_note_type(
         self,
         note_type_id: int,
-        name: str,
-        fields: list[str],
-        templates: list[dict[str, str]],
-        css: str,
+        name: str | None,
+        fields: list[str] | None,
+        templates: list[dict[str, str]] | None,
+        css: str | None,
     ) -> dict[str, Any]:
         return await self.executor.run(
             lambda adapter: adapter.update_note_type(note_type_id, name, fields, templates, css)

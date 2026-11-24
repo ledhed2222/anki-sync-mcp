@@ -95,6 +95,18 @@ async def test_note_type_crud_includes_fields_templates_and_css(resource_collect
             ".card { color: blue; }",
         )
         changed = await service.get_note_type(created["id"])
+        await service.update_note_type(created["id"], None, None, None, ".card { color: red; }")
+        css_only = await service.get_note_type(created["id"])
+        await service.update_note_type(
+            created["id"],
+            None,
+            None,
+            [{"name": "Renamed", "question_format": "Q {{Prompt}}", "answer_format": "A"}],
+            None,
+        )
+        templates_only = await service.get_note_type(created["id"])
+        with pytest.raises(ValueError, match="provide name"):
+            await service.update_note_type(created["id"], None, None, None, None)
 
     assert any(item["id"] == created["id"] for item in listed["items"])
     assert [(field["name"], field["ordinal"]) for field in fetched["fields"]] == [
@@ -108,6 +120,14 @@ async def test_note_type_crud_includes_fields_templates_and_css(resource_collect
     assert [field["name"] for field in changed["fields"]] == ["Prompt", "Response"]
     assert changed["templates"][0]["name"] == "Prompt Card"
     assert changed["css"] == ".card { color: blue; }"
+    assert css_only["css"] == ".card { color: red; }"
+    assert {k: v for k, v in css_only.items() if k != "css"} == {
+        k: v for k, v in changed.items() if k != "css"
+    }
+    assert templates_only["css"] == ".card { color: red; }"
+    assert templates_only["name"] == "Interview Updated"
+    assert templates_only["templates"][0]["name"] == "Renamed"
+    assert templates_only["templates"][0]["question_format"] == "Q {{Prompt}}"
 
 
 @pytest.mark.anyio
