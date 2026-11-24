@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -22,7 +23,7 @@ import anki.lang
 from anki._backend import RustBackend
 from anki.collection import AddNoteRequest, Collection
 from anki.config_pb2 import ConfigKey
-from anki.consts import CARD_TYPE_REV, QUEUE_TYPE_SUSPENDED
+from anki.consts import CARD_TYPE_REV, MODEL_CLOZE, QUEUE_TYPE_SUSPENDED
 from anki.decks import UpdateDeckConfigs
 from anki.errors import (
     Interrupted,
@@ -2064,13 +2065,25 @@ class CollectionAdapter:
         fields: list[str],
         templates: list[dict[str, str]],
         css: str,
+        kind: str = "standard",
     ) -> dict[str, Any]:
         if not name.strip():
             raise ValueError("note type name must not be blank")
         if self.collection.models.by_name(name) is not None:
             raise ValueError(f"note type {name} already exists")
         self._validate_note_type_parts(fields, templates)
+        if kind == "cloze":
+            if len(templates) != 1:
+                raise ValueError("a cloze note type must have exactly one template")
+            references = re.findall(r"\{\{cloze:([^}]+)\}\}", templates[0]["question_format"])
+            if not any(reference.strip() in fields for reference in references):
+                raise ValueError(
+                    "a cloze template's question_format must contain {{cloze:<Field>}} "
+                    "naming one of the note type's fields"
+                )
         model = self.collection.models.new(name)
+        if kind == "cloze":
+            model["type"] = MODEL_CLOZE
         for field_name in fields:
             self.collection.models.add_field(model, self.collection.models.new_field(field_name))
         for template_input in templates:
@@ -3723,9 +3736,10 @@ class AnkiCollectionService:
         fields: list[str],
         templates: list[dict[str, str]],
         css: str,
+        kind: str = "standard",
     ) -> dict[str, Any]:
         return await self.executor.run(
-            lambda adapter: adapter.create_note_type(name, fields, templates, css)
+            lambda adapter: adapter.create_note_type(name, fields, templates, css, kind)
         )
 
     async def update_note_type(

@@ -208,6 +208,60 @@ def test_schema_tools_require_full_sync_maintenance_and_preview(
         assert Path(receipt["result"]["backup"]["path"]).is_file()
 
 
+def test_create_token_covers_note_type_kind(phase3_settings: Settings) -> None:
+    base: dict[str, object] = {
+        "name": "Cloze Type",
+        "fields": ["Text", "Extra"],
+        "templates": [
+            {
+                "name": "Cloze",
+                "question_format": "{{cloze:Text}}",
+                "answer_format": "{{cloze:Text}}<br>{{Extra}}",
+            }
+        ],
+    }
+    with TestClient(create_app(phase3_settings)) as client:
+        _, call = _session(client)
+        failed, standard_preview = call(
+            "anki_note_types_change_preview", {"operation": "create", **base}
+        )
+        assert failed is False
+        failed, error = call(
+            "anki_note_types_create",
+            {
+                **base,
+                "kind": "cloze",
+                "confirmation_token": standard_preview["confirmation_token"],
+            },
+        )
+        assert failed is True
+        assert error["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+
+        failed, cloze_preview = call(
+            "anki_note_types_change_preview", {"operation": "create", "kind": "cloze", **base}
+        )
+        assert failed is False
+        failed, error = call(
+            "anki_note_types_create",
+            {**base, "confirmation_token": cloze_preview["confirmation_token"]},
+        )
+        assert failed is True
+        assert error["code"] == "DESTRUCTIVE_CONFIRMATION_REQUIRED"
+
+        failed, receipt = call(
+            "anki_note_types_create",
+            {
+                **base,
+                "kind": "cloze",
+                "confirmation_token": cloze_preview["confirmation_token"],
+            },
+        )
+        assert failed is False
+        failed, fetched = call("anki_note_types_get", {"note_type_id": receipt["result"]["id"]})
+        assert failed is False
+        assert fetched["kind"] == "cloze"
+
+
 def test_schema_apply_accepts_explicit_current_backup(
     phase3_settings: Settings,
 ) -> None:

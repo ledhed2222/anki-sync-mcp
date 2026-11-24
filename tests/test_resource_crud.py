@@ -190,3 +190,47 @@ async def test_media_store_rolls_back_apply_then_raise_failures(
 
     assert base64.b64decode(restored["content_base64"]) == b"original"
     assert base64.b64decode(rename_source["content_base64"]) == b"rename original"
+
+
+@pytest.mark.anyio
+async def test_cloze_note_type_creation_and_validation(resource_collection: str) -> None:
+    cloze_template = {
+        "name": "Cloze",
+        "question_format": "{{cloze:Text}}",
+        "answer_format": "{{cloze:Text}}<br>{{Extra}}",
+    }
+    async with AnkiCollectionService(resource_collection, max_page_size=100) as service:
+        created = await service.create_note_type(
+            "Deck · Cloze", ["Text", "Extra"], [cloze_template], "", "cloze"
+        )
+        fetched = await service.get_note_type(created["id"])
+        note = await service.create_note(
+            1, created["id"], {"Text": "{{c1::a}} {{c2::b}}", "Extra": ""}, []
+        )
+        standard = await service.create_note_type(
+            "Deck · Basic",
+            ["Front", "Back"],
+            [{"name": "Card 1", "question_format": "{{Front}}", "answer_format": "{{Back}}"}],
+            "",
+        )
+        standard_fetched = await service.get_note_type(standard["id"])
+        with pytest.raises(ValueError, match="exactly one template"):
+            await service.create_note_type(
+                "Two Templates",
+                ["Text"],
+                [cloze_template, {**cloze_template, "name": "Cloze 2"}],
+                "",
+                "cloze",
+            )
+        with pytest.raises(ValueError, match="cloze:<Field>"):
+            await service.create_note_type(
+                "No Cloze",
+                ["Text"],
+                [{**cloze_template, "question_format": "{{Text}}"}],
+                "",
+                "cloze",
+            )
+
+    assert fetched["kind"] == "cloze"
+    assert len(note["card_ids"]) == 2
+    assert standard_fetched["kind"] == "standard"
