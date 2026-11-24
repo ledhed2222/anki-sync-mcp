@@ -105,6 +105,8 @@ async def test_note_type_crud_includes_fields_templates_and_css(resource_collect
             None,
         )
         templates_only = await service.get_note_type(created["id"])
+        await service.update_note_type(created["id"], None, ["Cue", "Response"], None, None)
+        fields_only = await service.get_note_type(created["id"])
         with pytest.raises(ValueError, match="provide name"):
             await service.update_note_type(created["id"], None, None, None, None)
 
@@ -128,6 +130,10 @@ async def test_note_type_crud_includes_fields_templates_and_css(resource_collect
     assert templates_only["name"] == "Interview Updated"
     assert templates_only["templates"][0]["name"] == "Renamed"
     assert templates_only["templates"][0]["question_format"] == "Q {{Prompt}}"
+    assert [field["name"] for field in fields_only["fields"]] == ["Cue", "Response"]
+    # Anki's backend rewrites template references on rename; this guards against that changing.
+    assert fields_only["templates"][0]["question_format"] == "Q {{Cue}}"
+    assert fields_only["css"] == ".card { color: red; }"
 
 
 @pytest.mark.anyio
