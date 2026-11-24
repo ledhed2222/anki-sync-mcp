@@ -947,10 +947,14 @@ def create_app(settings: Settings) -> ASGIApp:
         )
 
     @scoped_tool(name="anki_decks_get", scope="read")
-    async def decks_get(deck_id: StableId, sync_before: SyncMedia = False) -> dict[str, Any]:
-        """Get metadata for one deck by stable Anki deck ID."""
+    async def decks_get(
+        deck_id: StableId | None = None,
+        name: DeckName | None = None,
+        sync_before: SyncMedia = False,
+    ) -> dict[str, Any]:
+        """Get metadata for one deck by stable Anki deck ID or by full deck name (exactly one)."""
         return await execute(
-            service.coordinated_read(lambda adapter: adapter.get_deck(deck_id), sync_before)
+            service.coordinated_read(lambda adapter: adapter.get_deck(deck_id, name), sync_before)
         )
 
     @scoped_tool(name="anki_deck_options_get", scope="read")

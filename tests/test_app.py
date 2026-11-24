@@ -1906,6 +1906,7 @@ def test_read_tools_have_protocol_happy_paths(client: TestClient) -> None:
     spanish = next(item for item in items if item["name"] == "Languages::Spanish")
     deck = call("anki_decks_get", {"deck_id": spanish["id"]})
     assert deck["name"] == "Languages::Spanish"
+    assert call("anki_decks_get", {"name": "Languages::Spanish"}) == deck
 
     cards = call("anki_cards_search", {"query": "hola", "offset": 0, "limit": 10})
     assert cards["total"] == 1
@@ -1957,6 +1958,9 @@ def test_tool_errors_are_machine_readable(
         return parsed
 
     missing = error_for("anki_decks_get", {"deck_id": 999999999}, 2)
+    missing_name = error_for("anki_decks_get", {"name": "No Such Deck"}, 2)
+    both = error_for("anki_decks_get", {"deck_id": 1, "name": "Default"}, 2)
+    neither = error_for("anki_decks_get", {}, 2)
     invalid = error_for("anki_cards_search", {"query": "", "limit": 0}, 3)
     sync_auth = error_for("anki_sync", {}, 4)
     destructive = error_for("anki_decks_delete", {"deck_id": 1}, 5)
@@ -1971,6 +1975,9 @@ def test_tool_errors_are_machine_readable(
         "anki_fsrs_reschedule_preview", {"config_id": 1, "desired_retention": 0.91}, 6
     )
     assert missing["code"] == "NOT_FOUND"
+    assert missing_name["code"] == "NOT_FOUND"
+    assert both["code"] == "INVALID_ARGUMENT"
+    assert neither["code"] == "INVALID_ARGUMENT"
     assert invalid["code"] == "INVALID_ARGUMENT"
     assert sync_auth["code"] == "AUTHENTICATION_FAILED"
     assert destructive["code"] == "INVALID_ARGUMENT"

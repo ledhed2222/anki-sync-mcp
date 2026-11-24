@@ -624,7 +624,14 @@ class CollectionAdapter:
             )
         return self._page(decks, offset, limit)
 
-    def get_deck(self, deck_id: int) -> dict[str, Any]:
+    def get_deck(self, deck_id: int | None = None, name: str | None = None) -> dict[str, Any]:
+        if (deck_id is None) == (name is None):
+            raise ValueError("exactly one of deck_id or name must be provided")
+        if name is not None:
+            found = self.collection.decks.id_for_name(name)
+            if found is None:
+                raise LookupError(f"deck {name!r} not found")
+            deck_id = int(found)
         deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
         if deck is None:
             raise LookupError(f"deck {deck_id} not found")
