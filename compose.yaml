@@ -2,7 +2,7 @@ services:
   anki-mcp:
     build:
       context: .
-    image: anki-mcp:0.2.0
+    image: anki-mcp:0.3.0
     restart: unless-stopped
     environment:
       MCP_HOST: "0.0.0.0"
