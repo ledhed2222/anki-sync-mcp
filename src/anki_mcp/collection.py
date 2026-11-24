@@ -152,8 +152,12 @@ class MediaSyncFailedError(TimeoutError):
 class MediaSyncInProgressError(RuntimeError):
     """Raised by media tools while the initial media sync has not completed."""
 
-    def __init__(self, media_sync: dict[str, Any]) -> None:
-        super().__init__("the initial media sync has not completed; media is incomplete")
+    def __init__(
+        self,
+        media_sync: dict[str, Any],
+        message: str = "the initial media sync has not completed; media is incomplete",
+    ) -> None:
+        super().__init__(message)
         self.media_sync = media_sync
 
 
@@ -306,6 +310,9 @@ class CollectionAdapter:
             "media_sync": self._media_sync_snapshot(),
             "pending_mutations": self._state.pending_receipt_count(),
         }
+
+    def has_receipt(self, idempotency_key: str) -> bool:
+        return self._state.get_receipt(idempotency_key) is not None
 
     def get_operation(self, idempotency_key: str) -> dict[str, Any]:
         operation = self._state.get_operation(idempotency_key)
@@ -2389,6 +2396,20 @@ class CollectionAdapter:
             "content_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
         }
 
+    def _require_media_sync_idle(self) -> None:
+        """Anki refuses media writes while its media sync thread runs.
+
+        Fail fast rather than wait: the pre-write sync already spent the bounded wait on this
+        thread, and waiting again would hold every other tool behind it.
+        """
+        if self._media_sync_running:
+            self._poll_media_sync()
+        if self._media_sync_running:
+            raise MediaSyncInProgressError(
+                self._media_sync_snapshot(),
+                "a media sync is running; retry once anki_status reports it finished",
+            )
+
     def store_media(self, filename: str, content_base64: str) -> dict[str, Any]:
         path = self._media_path(filename, require_exists=False)
         try:
@@ -2397,6 +2418,7 @@ class CollectionAdapter:
             raise ValueError("content_base64 must be valid base64") from exc
         if len(content) > self.max_media_bytes:
             raise ValueError(f"media content exceeds ANKI_MAX_MEDIA_BYTES ({self.max_media_bytes})")
+        self._require_media_sync_idle()
         existed = self.collection.media.have(filename)
         previous_content = path.read_bytes() if existed else None
         try:
@@ -2438,6 +2460,7 @@ class CollectionAdapter:
         content = old_path.read_bytes()
         if len(content) > self.max_media_bytes:
             raise ValueError(f"media file exceeds ANKI_MAX_MEDIA_BYTES ({self.max_media_bytes})")
+        self._require_media_sync_idle()
         try:
             stored_name = self.collection.media.write_data(new_filename, content)
             if stored_name != new_filename:
@@ -2462,6 +2485,7 @@ class CollectionAdapter:
 
     def delete_media(self, filename: str) -> dict[str, Any]:
         self._media_path(filename, require_exists=True)
+        self._require_media_sync_idle()
         self.collection.media.trash_files([filename])
         return {"filename": filename, "deleted": True}
 
@@ -3979,6 +4003,9 @@ class AnkiCollectionService:
 
     async def status(self) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.status())
+
+    async def has_receipt(self, idempotency_key: str) -> bool:
+        return await self.executor.run(lambda adapter: adapter.has_receipt(idempotency_key))
 
     async def get_operation(self, idempotency_key: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.get_operation(idempotency_key))

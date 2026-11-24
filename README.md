@@ -125,7 +125,7 @@ internet-facing server exposes.
 | `ANKI_SYNC_ON_WRITE` | `true` | Synchronize before and after coordinated mutations. Disabling this permits local changes to remain unsynchronized. |
 | `ANKI_SYNC_TIMEOUT_SECONDS` | `300` | Seconds a background media sync may go without reporting progress before it is aborted (`> 0`, up to `3600`). A sync that keeps advancing is never cut off; an aborted one resumes from the files already transferred on the next sync. |
 | `ANKI_MEDIA_SYNC_WAIT_SECONDS` | `10` | How long `anki_sync` waits for media synchronization before returning `media_sync.state = "in_progress"` (`0`-`60` seconds; `0` returns immediately). Media sync continues in the background; follow it with `anki_status`. |
-| `ANKI_INITIAL_MEDIA_SYNC` | `true` | Once authenticated, start a media sync on startup and keep retrying with backoff until one completes. Until then `anki_status` reports `ready: false` (`initial_media_sync_in_progress` or `initial_media_sync_failed`) and `anki_media_*` tools return `MEDIA_SYNC_IN_PROGRESS`; other tools and `/health/ready` are unaffected. Set `false` for deployments with no media. |
+| `ANKI_INITIAL_MEDIA_SYNC` | `true` | Once authenticated, start a media sync on startup and keep retrying with backoff until one completes. Until then `anki_status` reports `ready: false` (`initial_media_sync_in_progress` or `initial_media_sync_failed`) and `anki_media_*` tools return `MEDIA_SYNC_IN_PROGRESS`; other tools and `/health/ready` are unaffected. A media write made while a later media sync is still running returns `MEDIA_SYNC_IN_PROGRESS`; retry it with the same idempotency key once `anki_status` shows the sync finished. Set `false` for deployments with no media. |
 | `ANKI_BOOTSTRAP_MODE` | `disabled` | Startup behavior: `disabled`, or `download_if_empty` to authenticate and perform a download-only initialization when the local collection is empty. A non-empty collection is left untouched and the server starts normally, so the setting can stay on across restarts. Startup fails rather than uploading if the server requests a full upload. |
 
 The persisted `anki_data` volume also contains synchronization authentication state, mutation
@@ -147,12 +147,19 @@ receipts, and backups. Preserve the volume across container recreation.
 | `MCP_MAX_RENDERED_FIELD_BYTES` | `262144` | UTF-8 byte limit for each rendered text field in responses (`1`-`4194304`); oversized values are truncated and marked. |
 | `MCP_MAX_CARD_FIELDS` | `100` | Maximum fields or templates returned for a note or note type (`1`-`1000`); omitted counts are reported. |
 | `ANKI_MAX_MEDIA_BYTES` | `1048576` | Maximum decoded size of a media file read, written, or renamed (`1`-`16777216` bytes). |
+| `ANKI_MEDIA_URL_HOSTS` | `cdn.jsdelivr.net,fonts.gstatic.com,raw.githubusercontent.com,unpkg.com,upload.wikimedia.org` | Comma-separated hosts that `anki_media_store` may download a `url` from, replacing the default list. The default covers npm and GitHub CDNs (Fontsource fonts), Google Fonts files and Wikipedia/Wikimedia Commons media. Only HTTPS is accepted, every redirect must stay on a listed host, and the download stops at `ANKI_MAX_MEDIA_BYTES`. Only the default HTTPS port is accepted, and each download must finish within 30 seconds. On `cdn.jsdelivr.net` and `unpkg.com` the URL must name an exact package version (`pkg@1.2.3`); on `raw.githubusercontent.com` and jsdelivr's `/gh/` it must name a full 40-character commit hash, so the content behind a URL cannot change after it was checked. Other hosts, including Wikimedia and any you add, are not checked for pinning. The stored filename must have an image (including SVG), audio, video or font extension. The tool's description lists the hosts and extensions in effect. Failures return `MEDIA_URL_HOST_NOT_ALLOWED`, `MEDIA_URL_NOT_PINNED`, `MEDIA_TYPE_NOT_ALLOWED`, `MEDIA_URL_NOT_FOUND`, `MEDIA_TOO_LARGE` or `MEDIA_DOWNLOAD_FAILED`. Downloads honor `HTTPS_PROXY` and `NO_PROXY`; set them to keep the server's address from the listed hosts. Anki's sync client honors the same variables, so `HTTPS_PROXY` also routes sync traffic unless the sync host is listed in `NO_PROXY`. The idempotency key covers the URL, not the downloaded bytes: retrying under a key that already has a receipt returns that receipt without downloading again, even if the file behind an unpinned URL has since changed. Use a new key to fetch it again. Set this variable empty to refuse every URL. |
+| `ANKI_MEDIA_URL_HOSTS_FILE` | unset | Path to a file of allowed hosts, one per line; blank lines and `#` comments are ignored. Use instead of `ANKI_MEDIA_URL_HOSTS`, not with it. |
 | `MCP_MAX_RESPONSE_BYTES` | `1048576` | Maximum serialized tool-result size (`1024`-`16777216` bytes). It must be at least `MCP_MAX_RENDERED_FIELD_BYTES + 4096`. |
 | `MCP_MAX_REQUEST_BYTES` | `1048576` | Maximum MCP request-body size (`1024`-`16777216` bytes); larger requests receive HTTP 413. |
 
 Boolean values accept the forms supported by Pydantic settings, including `true`/`false`,
 `1`/`0`, and `yes`/`no`. Invalid or unknown configuration causes startup to fail instead of
 silently falling back to a default.
+
+SVG files stored by URL can contain scripts. A script in an SVG stays inert only when a card
+loads the file through `<img src>`; inline SVG, `<object>`, `<embed>` and `<iframe>` run it in
+the reviewer. This server does not check card HTML, so a client that writes cards referencing
+SVG media is responsible for loading it only through `<img>`.
 
 ### Human confirmation
 
