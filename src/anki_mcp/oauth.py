@@ -85,6 +85,23 @@ def verify_password(password: str, encoded: str) -> bool:
     return hmac.compare_digest(digest, base64.b64decode(expected))
 
 
+def _is_loopback_redirect(uri: str) -> bool:
+    """RFC 8252 section 7.3: native clients redirect to a loopback port they pick at runtime."""
+    parts = urlsplit(uri)
+    try:
+        port = parts.port
+    except ValueError:
+        return False
+    return (
+        port is not None
+        and parts.scheme == "http"
+        and parts.hostname in {"localhost", "127.0.0.1", "::1"}
+        and parts.username is None
+        and parts.password is None
+        and not parts.fragment
+    )
+
+
 def _token_key(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -127,13 +144,16 @@ class BuiltinOAuthProvider:
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         requested = {str(uri) for uri in client_info.redirect_uris or []}
-        if not requested or not requested <= self._redirect_uris:
+        refused = {uri for uri in requested - self._redirect_uris if not _is_loopback_redirect(uri)}
+        if not requested or refused:
             _LOGGER.debug(
-                "refused client registration: redirect_uris %r not in MCP_OAUTH_REDIRECT_URIS",
-                sorted(uri[:200] for uri in requested - self._redirect_uris),
+                "refused client registration: redirect_uris %r not loopback or in "
+                "MCP_OAUTH_REDIRECT_URIS",
+                sorted(uri[:200] for uri in refused),
             )
             raise RegistrationError(
-                "invalid_redirect_uri", "redirect_uris must be listed in MCP_OAUTH_REDIRECT_URIS"
+                "invalid_redirect_uri",
+                "redirect_uris must be loopback or listed in MCP_OAUTH_REDIRECT_URIS",
             )
         if len(self._clients) >= _MAX_CLIENTS:
             raise RegistrationError("invalid_client_metadata", "client registration limit reached")
