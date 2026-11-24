@@ -57,6 +57,22 @@ async def test_gets_deck_by_stable_id(populated_collection: str) -> None:
 
 
 @pytest.mark.anyio
+async def test_gets_deck_by_name_case_insensitively_without_creating(
+    populated_collection: str,
+) -> None:
+    async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
+        before = await service.list_decks(offset=0, limit=100)
+        by_name = await service.coordinated_read(
+            lambda adapter: adapter.get_deck(name="languages::spanish")
+        )
+        with pytest.raises(LookupError, match="deck"):
+            await service.coordinated_read(lambda adapter: adapter.get_deck(name="No Such Deck"))
+        after = await service.list_decks(offset=0, limit=100)
+    assert by_name["name"] == "Languages::Spanish"
+    assert after == before
+
+
+@pytest.mark.anyio
 async def test_searches_and_gets_cards(populated_collection: str) -> None:
     async with AnkiCollectionService(populated_collection, max_page_size=100) as service:
         search = await service.search_cards(query="hola", offset=0, limit=10)
