@@ -1373,6 +1373,9 @@ def test_media_store_downloads_url_from_allowed_host(
     neither = call(4, {"filename": "x.woff2"})
     missing = call(5, {"filename": "x.woff2", "url": "https://cdn.jsdelivr.net/missing.woff2"})
     script = call(7, {"filename": "x.js", "url": url})
+    keyed = {"filename": "keyed.woff2", "url": url, "idempotency_key": "font-1"}
+    first = json.loads(call(8, keyed)["content"][0]["text"])
+    replayed = json.loads(call(9, keyed)["content"][0]["text"])
 
     receipt = json.loads(stored["content"][0]["text"])
     assert receipt["result"] == {"filename": "inter.woff2", "size_bytes": 10, "created": True}
@@ -1387,7 +1390,8 @@ def test_media_store_downloads_url_from_allowed_host(
     assert error_code(neither) == "INVALID_ARGUMENT"
     assert error_code(missing) == "MEDIA_URL_NOT_FOUND"
     assert error_code(script) == "MEDIA_TYPE_NOT_ALLOWED"
-    assert len(downloads) == 2
+    assert replayed == first
+    assert len(downloads) == 3
 
 
 def test_sync_tools_use_server_configuration_without_exposing_credentials(

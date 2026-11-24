@@ -311,6 +311,9 @@ class CollectionAdapter:
             "pending_mutations": self._state.pending_receipt_count(),
         }
 
+    def has_receipt(self, idempotency_key: str) -> bool:
+        return self._state.get_receipt(idempotency_key) is not None
+
     def get_operation(self, idempotency_key: str) -> dict[str, Any]:
         operation = self._state.get_operation(idempotency_key)
         if operation is None:
@@ -4000,6 +4003,9 @@ class AnkiCollectionService:
 
     async def status(self) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.status())
+
+    async def has_receipt(self, idempotency_key: str) -> bool:
+        return await self.executor.run(lambda adapter: adapter.has_receipt(idempotency_key))
 
     async def get_operation(self, idempotency_key: str) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.get_operation(idempotency_key))

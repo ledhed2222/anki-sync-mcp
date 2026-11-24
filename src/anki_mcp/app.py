@@ -2130,21 +2130,23 @@ def create_app(settings: Settings) -> ASGIApp:
             request = {"filename": filename, "content_base64": content_base64}
         else:
             request = {"filename": filename, "url": url}
-            try:
-                check_media_filename(filename)
-                content = await asyncio.to_thread(
-                    download_media, url, settings.media_url_hosts, settings.max_media_bytes
-                )
-            except MediaDownloadError as exc:
-                raise_tool_error(exc.code, str(exc), exc)
-            content_base64 = base64.b64encode(content).decode("ascii")
-        return await mutate(
-            "anki_media_store",
-            idempotency_key,
-            request,
-            lambda adapter: adapter.store_media(filename, cast(str, content_base64)),
-            sync_media=True,
-        )
+            # A key with a receipt replays it (or reports a conflict) without storing again.
+            if idempotency_key is None or not await service.has_receipt(idempotency_key):
+                try:
+                    check_media_filename(filename)
+                    content = await asyncio.to_thread(
+                        download_media, url, settings.media_url_hosts, settings.max_media_bytes
+                    )
+                except MediaDownloadError as exc:
+                    raise_tool_error(exc.code, str(exc), exc)
+                content_base64 = base64.b64encode(content).decode("ascii")
+
+        def store(adapter: CollectionAdapter) -> dict[str, Any]:
+            if content_base64 is None:
+                raise RuntimeError("the receipt for this idempotency key disappeared; retry")
+            return adapter.store_media(filename, content_base64)
+
+        return await mutate("anki_media_store", idempotency_key, request, store, sync_media=True)
 
     allowed_hosts = ", ".join(sorted(settings.media_url_hosts)) or "none"
     media_store.__doc__ = (
