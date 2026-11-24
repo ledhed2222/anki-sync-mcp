@@ -3571,6 +3571,25 @@ class CollectionExecutor:
     async def run(self, function: Callable[[CollectionAdapter], T]) -> T:
         return await asyncio.wrap_future(self.submit(function))
 
+    async def full_sync_progress(self) -> tuple[int, int]:
+        """Bytes transferred and total of a running full sync, read while it holds the worker.
+
+        The one call made off the owning thread: Anki's progress state has its own lock and is
+        built to be polled from another thread during a sync, which is how Anki Desktop draws
+        its sync progress bar.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            return 0, 0
+
+        def read() -> tuple[int, int]:
+            progress = adapter.collection.latest_progress()
+            if not progress.HasField("full_sync"):
+                return 0, 0
+            return progress.full_sync.transferred, progress.full_sync.total
+
+        return await asyncio.to_thread(read)
+
     async def close(self) -> None:
         if self._adapter is not None:
             await self.run(lambda adapter: adapter.close())
@@ -4058,6 +4077,9 @@ class AnkiCollectionService:
 
     async def check_ready(self) -> bool:
         return await self.executor.run(lambda adapter: adapter.check_ready())
+
+    async def full_sync_progress(self) -> tuple[int, int]:
+        return await self.executor.full_sync_progress()
 
     async def media_sync_active(self) -> bool:
         return await self.executor.run(lambda adapter: adapter.media_sync_active())

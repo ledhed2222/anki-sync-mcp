@@ -58,6 +58,7 @@ from anki_mcp.media_url import (
 )
 from anki_mcp.migrate import migrate_legacy_install
 from anki_mcp.oauth import BuiltinOAuthProvider
+from anki_mcp.registration import Registration
 from anki_mcp.users import CollectionRegistry, UserStore
 
 T = TypeVar("T")
@@ -639,6 +640,7 @@ def create_app(settings: Settings) -> ASGIApp:
         return subject
 
     service: Any = _CurrentUserService(registry, lambda: current_user_id())
+    registration = Registration(settings, users, registry)
     oauth_provider = BuiltinOAuthProvider(settings, users)
     auth_settings = AuthSettings(
         issuer_url=AnyHttpUrl(settings.public_url),
@@ -2381,6 +2383,7 @@ def create_app(settings: Settings) -> ASGIApp:
                 yield
             finally:
                 driver.cancel()
+                await registration.close()
                 await registry.close_all()
 
     routes = [
@@ -2388,6 +2391,7 @@ def create_app(settings: Settings) -> ASGIApp:
         Route("/health/ready", ready, methods=["GET"]),
         *mcp_app.routes,
         *oauth_provider.routes(),
+        *registration.routes(),
     ]
     app = Starlette(routes=routes, middleware=mcp_app.user_middleware, lifespan=lifespan)
     app.state.settings = settings
@@ -2396,6 +2400,6 @@ def create_app(settings: Settings) -> ASGIApp:
     limited: ASGIApp = RequestBodyLimitMiddleware(
         app, settings.max_request_bytes, settings.mcp_path
     )
-    for path in ("/oauth", "/register", "/token", "/revoke"):
+    for path in ("/oauth", "/register", "/token", "/revoke", "/setup"):
         limited = RequestBodyLimitMiddleware(limited, _OAUTH_MAX_REQUEST_BYTES, path)
     return limited

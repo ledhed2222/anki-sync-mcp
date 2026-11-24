@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import getpass
 import logging
 import os
 import re
+import smtplib
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -33,6 +35,10 @@ def valid_user_id(user_id: str) -> bool:
     return _USER_ID.fullmatch(user_id) is not None
 
 
+# Setup stages that keep a user from signing in: they have not finished registering.
+SETUP_BLOCKS_SIGN_IN = frozenset({"password", "ankiweb", "syncing", "failed"})
+
+
 @dataclass(frozen=True)
 class User:
     id: str
@@ -40,6 +46,15 @@ class User:
     sync_username: str
     sync_password: str | None
     sync_endpoint: str | None
+    email: str | None = None
+    setup: str | None = None
+    setup_sha256: str | None = None
+    setup_expires_at: float = 0.0
+    setup_error: str | None = None
+
+    @property
+    def can_sign_in(self) -> bool:
+        return self.password_hash is not None and self.setup not in SETUP_BLOCKS_SIGN_IN
 
 
 def _parse_users(raw: dict[str, Any]) -> dict[str, User]:
@@ -59,6 +74,11 @@ def _parse_users(raw: dict[str, Any]) -> dict[str, User]:
             sync_username=str(entry.get("sync_username") or ""),
             sync_password=entry.get("sync_password") or None,
             sync_endpoint=endpoint or None,
+            email=entry.get("email") or None,
+            setup=entry.get("setup") or None,
+            setup_sha256=entry.get("setup_sha256") or None,
+            setup_expires_at=float(entry.get("setup_expires_at") or 0),
+            setup_error=entry.get("setup_error") or None,
         )
     return users
 
@@ -85,6 +105,10 @@ class UserStore:
     def get(self, user_id: str) -> User | None:
         self._reload()
         return self._users.get(user_id)
+
+    def all(self) -> list[User]:
+        self._reload()
+        return list(self._users.values())
 
 
 @dataclass
@@ -223,6 +247,17 @@ def save_users_file(path: Path, raw: dict[str, Any]) -> None:
     PersistentState._atomic_json(path, raw, secret=True)
 
 
+def update_users_file[T](path: Path, change: Callable[[dict[str, Any]], T]) -> T:
+    """Read, change and write the users file under a lock shared by the server and the CLI."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path.with_name(path.name + ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        raw = load_users_file(path)
+        result = change(raw)
+        save_users_file(path, raw)
+        return result
+
+
 def _prompt_password(prompt: str, minimum: int) -> str:
     password = getpass.getpass(f"{prompt}: ")
     if password != getpass.getpass(f"Repeat {prompt.lower()}: "):
@@ -242,7 +277,31 @@ def _password_hash(args: argparse.Namespace) -> str:
     return args.hash
 
 
+def _send_link(user_id: str, email: str, token: str, *, reset: bool) -> None:
+    from anki_mcp.config import Settings
+    from anki_mcp.registration import send_setup_email, setup_link
+
+    settings = Settings()  # pyright: ignore[reportCallIssue] - values come from environment
+    link = setup_link(settings, token)
+    if not settings.smtp_host:
+        print(f"MCP_SMTP_HOST is not set, so no email was sent. Send {email} this link:\n{link}")
+        return
+    try:
+        send_setup_email(settings, email, user_id, link, reset=reset)
+    except (OSError, smtplib.SMTPException) as exc:
+        sys.exit(f"The link was saved but the email failed ({type(exc).__name__}); retry later.")
+    print(f"Sent a {'password reset' if reset else 'setup'} link to {email}.")
+
+
+def _setup_hours() -> float:
+    from anki_mcp.config import Settings
+
+    return Settings().setup_link_hours  # pyright: ignore[reportCallIssue]
+
+
 def main(argv: list[str] | None = None) -> None:
+    from anki_mcp.registration import begin_setup, valid_email
+
     parser = argparse.ArgumentParser(prog="anki-mcp-user", description=__doc__)
     parser.add_argument(
         "--file",
@@ -255,49 +314,96 @@ def main(argv: list[str] | None = None) -> None:
     remove = commands.add_parser("remove", help="delete an account; its data directory is kept")
     remove.add_argument("user_id")
     hash_help = "use a hash from anki-mcp-hash-password instead of prompting"
-    add = commands.add_parser("add", help="create a user")
+    add = commands.add_parser("add", help="create a user with a password you type")
     add.add_argument("user_id")
     add.add_argument("--hash", help=hash_help)
     add.add_argument("--sync-username", default="")
     add.add_argument("--sync-host", default="", help="empty for AnkiWeb")
     add.add_argument("--sync-password", action="store_true", help="prompt for the sync password")
+    invite = commands.add_parser("invite", help="create a user and email them a setup link")
+    invite.add_argument("user_id")
+    invite.add_argument("--email", help="required unless --resend finds one on file")
+    invite.add_argument("--sync-host", default="", help="empty for AnkiWeb")
+    invite.add_argument("--resend", action="store_true", help="new link for an unfinished setup")
     passwd = commands.add_parser("passwd", help="set a user's login password")
     passwd.add_argument("user_id")
     passwd.add_argument("--hash", help=hash_help)
+    reset = commands.add_parser("reset", help="email a user a link to choose a new password")
+    reset.add_argument("user_id")
     args = parser.parse_args(argv)
 
-    raw = load_users_file(args.file)
-    users: dict[str, Any] = raw["users"]
     if args.command == "list":
-        for user_id in sorted(users):
+        for user_id in sorted(load_users_file(args.file)["users"]):
             print(user_id)
         return
     if not valid_user_id(args.user_id):
         sys.exit("User ids use a-z, 0-9, _ and -, start with a letter or digit, at most 64.")
-    if args.command != "add" and args.user_id not in users:
-        sys.exit(f"No user {args.user_id!r}.")
-
-    if args.command == "add":
-        if args.user_id in users:
-            sys.exit(f"User {args.user_id!r} already exists.")
+    creating = args.command == "add" or (args.command == "invite" and not args.resend)
+    if args.command in {"add", "invite"}:
         try:
             endpoint = validate_sync_endpoint(args.sync_host)
         except ValueError as exc:
             sys.exit(str(exc))
-        entry: dict[str, Any] = {
-            "password_hash": _password_hash(args),
-            "sync_username": args.sync_username,
-            "sync_endpoint": endpoint,
-        }
-        if args.sync_password:
-            entry["sync_password"] = _prompt_password("Sync password", 1)
-        users[args.user_id] = entry
-    elif args.command == "remove":
-        del users[args.user_id]
+    if args.command == "invite" and args.email is not None and not valid_email(args.email):
+        sys.exit("That doesn't look like an email address.")
+    # Prompt and hash before taking the lock, so a slow typist never blocks the server.
+    password_hash = _password_hash(args) if args.command in {"add", "passwd"} else None
+    sync_password = (
+        _prompt_password("Sync password", 1)
+        if args.command == "add" and args.sync_password
+        else None
+    )
+    hours = _setup_hours() if args.command in {"invite", "reset"} else 0.0
+
+    def change(raw: dict[str, Any]) -> tuple[str, str] | None:
+        users: dict[str, Any] = raw["users"]
+        if creating and args.user_id in users:
+            sys.exit(f"User {args.user_id!r} already exists.")
+        if not creating and args.user_id not in users:
+            sys.exit(f"No user {args.user_id!r}.")
+        if args.command == "add":
+            users[args.user_id] = {
+                "password_hash": password_hash,
+                "sync_username": args.sync_username,
+                "sync_endpoint": endpoint,
+            }
+            if sync_password is not None:
+                users[args.user_id]["sync_password"] = sync_password
+        elif args.command == "remove":
+            del users[args.user_id]
+        elif args.command == "passwd":
+            users[args.user_id]["password_hash"] = password_hash
+        elif args.command == "invite" and creating:
+            if args.email is None:
+                sys.exit("--email is required.")
+            users[args.user_id] = {
+                "email": args.email,
+                "sync_username": "",
+                "sync_endpoint": endpoint,
+            }
+            return args.email, begin_setup(users[args.user_id], "password", hours)
+        elif args.command == "invite":
+            entry = users[args.user_id]
+            if entry.get("setup") not in SETUP_BLOCKS_SIGN_IN:
+                sys.exit(f"{args.user_id} has finished setup; use 'reset' to change a password.")
+            entry["email"] = args.email or entry.get("email")
+            if not entry["email"]:
+                sys.exit("--email is required.")
+            return entry["email"], begin_setup(entry, entry["setup"], hours)
+        else:
+            entry = users[args.user_id]
+            if entry.get("setup") in SETUP_BLOCKS_SIGN_IN:
+                sys.exit(f"{args.user_id} hasn't finished setup; use 'invite --resend'.")
+            if not entry.get("email"):
+                sys.exit(f"No email on file for {args.user_id}.")
+            return entry["email"], begin_setup(entry, "reset", hours)
+        return None
+
+    sent = update_users_file(args.file, change)
+    if args.command == "remove":
         print(f"Removed {args.user_id}. Their collection directory was not deleted.")
-    else:
-        users[args.user_id]["password_hash"] = _password_hash(args)
-    save_users_file(args.file, raw)
+    if sent is not None:
+        _send_link(args.user_id, sent[0], sent[1], reset=args.command == "reset")
 
 
 if __name__ == "__main__":
