@@ -2300,11 +2300,16 @@ class CollectionAdapter:
         media_dir = Path(self.collection.media.dir())
         with os.scandir(media_dir) as entries:
             names = [entry.name for entry in entries if entry.is_file(follow_symlinks=False)]
-        page = self._page(sorted(names, key=str.casefold), offset, limit)
-        page["items"] = [
-            {"filename": name, "size_bytes": (media_dir / name).stat().st_size}
-            for name in page["items"]
-        ]
+        page = self._page(sorted(names, key=lambda name: (name.casefold(), name)), offset, limit)
+        items = []
+        for name in page["items"]:
+            try:
+                size = (media_dir / name).stat().st_size
+            except FileNotFoundError:
+                # A background media sync can delete a file after it was listed.
+                continue
+            items.append({"filename": name, "size_bytes": size})
+        page["items"] = items
         return page
 
     def get_media(self, filename: str) -> dict[str, Any]:

@@ -143,7 +143,7 @@ receipts, and backups. Preserve the volume across container recreation.
 | `ANKI_CONFIRMATION_MODE` | `token` | How destructive tools get approval. `token`: the preview token alone. `elicit`: also asks the person through MCP elicitation when the client supports it, otherwise falls back to `token`. `elicit_required`: refuses destructive calls from clients that cannot elicit. A prompt left unanswered for `ANKI_CONFIRMATION_TTL_SECONDS` counts as a decline. Full-sync tools ignore this setting and always ask (see below). Both elicit modes, and `ANKI_ALLOW_FULL_SYNC=true`, switch the MCP endpoint to SSE responses. |
 | `ANKI_MAX_BATCH_SIZE` | `50` | Maximum notes accepted by one atomic batch-create operation (`1`-`500`). |
 | `MCP_MAX_PAGE_SIZE` | `100` | Maximum `limit` accepted by paginated tools (`1`-`1000`). |
-| `MCP_MAX_SEARCH_SCAN` | `10000` | Maximum collection items that bounded list/search and tag operations may scan (`1`-`1000000`). |
+| `MCP_MAX_SEARCH_SCAN` | `10000` | Maximum collection items that bounded list/search and tag operations may scan (`1`-`1000000`). `anki_media_list` pages the whole media folder and is not bounded by it. |
 | `MCP_MAX_RENDERED_FIELD_BYTES` | `262144` | UTF-8 byte limit for each rendered text field in responses (`1`-`4194304`); oversized values are truncated and marked. |
 | `MCP_MAX_CARD_FIELDS` | `100` | Maximum fields or templates returned for a note or note type (`1`-`1000`); omitted counts are reported. |
 | `ANKI_MAX_MEDIA_BYTES` | `1048576` | Maximum decoded size of a media file read, written, or renamed (`1`-`16777216` bytes). |
