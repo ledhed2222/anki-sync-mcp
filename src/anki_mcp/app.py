@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -41,6 +42,7 @@ from anki_mcp.collection import (
     FullSyncRequiredError,
     IdempotencyConflictError,
     MediaSyncFailedError,
+    MediaSyncInProgressError,
     ResourceLimitError,
     SyncLoginRequiredError,
 )
@@ -51,6 +53,9 @@ from anki_mcp.oauth import BuiltinOAuthProvider
 T = TypeVar("T")
 LOGGER = logging.getLogger(__name__)
 _OAUTH_MAX_REQUEST_BYTES = 16_384
+_INITIAL_MEDIA_SYNC_POLL_SECONDS = 2.0
+# /health/ready stays a process-level check: a large first media sync must not mark it unhealthy.
+_PROCESS_READY_REASONS = {None, "initial_media_sync_in_progress", "initial_media_sync_failed"}
 Offset = StrictInt
 PageLimit = StrictInt
 StableId = Annotated[StrictInt, Field(gt=0)]
@@ -543,6 +548,7 @@ def create_app(settings: Settings) -> ASGIApp:
         settings.sync_on_read,
         settings.sync_on_write,
         settings.media_sync_wait_seconds,
+        settings.initial_media_sync,
     )
     oauth_provider: BuiltinOAuthProvider | None = None
     auth_settings: AuthSettings | None = None
@@ -656,6 +662,10 @@ def create_app(settings: Settings) -> ASGIApp:
             raise_tool_error("AUTHENTICATION_FAILED", str(exc), exc)
         except MediaSyncFailedError as exc:
             raise_tool_error("MEDIA_SYNC_FAILED", str(exc), exc)
+        except MediaSyncInProgressError as exc:
+            raise_tool_error(
+                "MEDIA_SYNC_IN_PROGRESS", str(exc), exc, details={"media_sync": exc.media_sync}
+            )
         except BackupFailedError as exc:
             raise_tool_error(
                 "BACKUP_FAILED",
@@ -2159,7 +2169,7 @@ def create_app(settings: Settings) -> ASGIApp:
             current_status = await service.status()
         except Exception:
             current_status = {"ready": False, "readiness_reason": "collection_unavailable"}
-        if not current_status["ready"]:
+        if current_status["readiness_reason"] not in _PROCESS_READY_REASONS:
             return JSONResponse(
                 {
                     "status": "not_ready",
@@ -2168,6 +2178,15 @@ def create_app(settings: Settings) -> ASGIApp:
                 status_code=503,
             )
         return JSONResponse({"status": "ready"})
+
+    async def drive_initial_media_sync() -> None:
+        while True:
+            try:
+                if not await service.advance_initial_media_sync():
+                    return
+            except Exception:
+                LOGGER.exception("initial media sync step failed")
+            await asyncio.sleep(_INITIAL_MEDIA_SYNC_POLL_SECONDS)
 
     @asynccontextmanager
     async def lifespan(_: Starlette) -> AsyncGenerator[None]:
@@ -2184,7 +2203,16 @@ def create_app(settings: Settings) -> ASGIApp:
                     password,
                     settings.sync_endpoint,
                 )
-            yield
+            driver = (
+                asyncio.create_task(drive_initial_media_sync())
+                if settings.initial_media_sync
+                else None
+            )
+            try:
+                yield
+            finally:
+                if driver is not None:
+                    driver.cancel()
 
     routes = [
         Route("/health/live", live, methods=["GET"]),

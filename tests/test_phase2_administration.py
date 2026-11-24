@@ -15,7 +15,7 @@ from anki.errors import NetworkError
 from anki.sync import SyncAuth, SyncOutput
 from anki.sync_pb2 import MediaSyncProgress, MediaSyncStatusResponse
 
-from anki_mcp.collection import AnkiCollectionService
+from anki_mcp.collection import AnkiCollectionService, CollectionAdapter, MediaSyncInProgressError
 from anki_mcp.state import PersistentState
 
 
@@ -728,3 +728,147 @@ async def test_backup_can_restore_into_a_disposable_collection(
         assert restored.find_notes('"phase two 1"')
     finally:
         restored.close()
+
+
+def _patch_media_backend(monkeypatch: pytest.MonkeyPatch, backend: dict[str, object]) -> list[bool]:
+    """Serve media_sync_status from a mutable dict so tests decide what each poll sees."""
+    sync_calls: list[bool] = []
+
+    def sync_collection(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        sync_calls.append(sync_media)
+        return SyncOutput(required=0)
+
+    def media_sync_status(self: object) -> MediaSyncStatusResponse:
+        error = backend.pop("error", None)
+        if isinstance(error, Exception):
+            raise error
+        return _media_status(bool(backend["active"]), str(backend["checked"]))
+
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="phase2", endpoint=endpoint),
+    )
+    monkeypatch.setattr(Collection, "sync_collection", sync_collection)
+    monkeypatch.setattr("anki._backend.RustBackend.media_sync_status", media_sync_status)
+    return sync_calls
+
+
+@pytest.mark.anyio
+async def test_initial_media_sync_gates_readiness_and_media_tools_until_complete(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend: dict[str, object] = {"active": True, "checked": "10"}
+    sync_calls = _patch_media_backend(monkeypatch, backend)
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, initial_media_sync=True
+    ) as service:
+        before_login = await service.status()
+        await service.list_media(0, 10)
+        await service.sync_login("user", "password", None)
+        assert await service.advance_initial_media_sync() is True
+        running = await service.status()
+        with pytest.raises(MediaSyncInProgressError) as guarded:
+            await service.list_media(0, 10)
+        await service.list_decks(0, 10)
+        backend.update(active=False, checked="30")
+        assert await service.advance_initial_media_sync() is False
+        finished = await service.status()
+        await service.list_media(0, 10)
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, initial_media_sync=True
+    ) as restarted:
+        assert await restarted.advance_initial_media_sync() is False
+        recovered = await restarted.status()
+
+    assert before_login["readiness_reason"] == "authentication_required"
+    assert sync_calls == [True]
+    assert running["ready"] is False
+    assert running["readiness_reason"] == "initial_media_sync_in_progress"
+    assert running["media_sync"]["checked"] == "10"
+    assert guarded.value.media_sync["state"] == "in_progress"
+    assert finished["ready"] is True
+    assert finished["readiness_reason"] is None
+    assert finished["last_media_sync_at"]
+    assert recovered["ready"] is True
+
+
+@pytest.mark.anyio
+async def test_initial_media_sync_retries_after_failure_with_backoff(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend: dict[str, object] = {
+        "active": True,
+        "checked": "1",
+        "error": NetworkError("down", None, None, None),
+    }
+    sync_calls = _patch_media_backend(monkeypatch, backend)
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, initial_media_sync=True
+    ) as service:
+        await service.sync_login("user", "password", None)
+        assert await service.advance_initial_media_sync() is True
+        failed = await service.status()
+        # Still inside the backoff window, so no new attempt is made.
+        assert await service.advance_initial_media_sync() is True
+        assert sync_calls == [True]
+
+        def expire_backoff(adapter: CollectionAdapter) -> None:
+            adapter._initial_media_sync_retry_at = 0  # pyright: ignore[reportPrivateUsage]
+
+        service.executor.submit(expire_backoff).result()
+        backend.update(active=False)
+        assert await service.advance_initial_media_sync() is False
+        recovered = await service.status()
+
+    assert failed["ready"] is False
+    assert failed["readiness_reason"] == "initial_media_sync_failed"
+    assert failed["media_sync"]["error"] == "NETWORK_ERROR"
+    assert sync_calls == [True, True]
+    assert recovered["ready"] is True
+
+
+@pytest.mark.anyio
+async def test_initial_media_sync_restarts_after_process_restart_mid_sync(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend: dict[str, object] = {"active": True, "checked": "5"}
+    sync_calls = _patch_media_backend(monkeypatch, backend)
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, initial_media_sync=True
+    ) as service:
+        await service.sync_login("user", "password", None)
+        assert await service.advance_initial_media_sync() is True
+
+    async with AnkiCollectionService(
+        phase2_collection, max_page_size=100, initial_media_sync=True
+    ) as restarted:
+        interrupted = await restarted.status()
+        backend.update(active=False, checked="9")
+        assert await restarted.advance_initial_media_sync() is False
+        finished = await restarted.status()
+
+    assert interrupted["readiness_reason"] == "initial_media_sync_in_progress"
+    assert interrupted["media_sync_progress"]["checked"] == "5"
+    assert sync_calls == [True, True]
+    assert finished["ready"] is True
+
+
+@pytest.mark.anyio
+async def test_initial_media_sync_disabled_leaves_readiness_and_media_alone(
+    phase2_collection: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sync_calls = _patch_media_backend(monkeypatch, {"active": True, "checked": "0"})
+
+    async with AnkiCollectionService(phase2_collection, max_page_size=100) as service:
+        await service.sync_login("user", "password", None)
+        assert await service.advance_initial_media_sync() is False
+        status = await service.status()
+        await service.list_media(0, 10)
+
+    assert sync_calls == []
+    assert status["ready"] is True

@@ -335,9 +335,7 @@ def test_exact_tool_inventory(client: TestClient) -> None:
     simulation_result = simulation_output["properties"]["result"]
     assert simulation_result["discriminator"]["propertyName"] == "mode"
     assert (
-        by_name["anki_fsrs_reschedule"]["inputSchema"]["properties"]["confirmation_token"][
-            "type"
-        ]
+        by_name["anki_fsrs_reschedule"]["inputSchema"]["properties"]["confirmation_token"]["type"]
         == "string"
     )
     preset_get = by_name["anki_deck_presets_get"]["inputSchema"]["properties"]
@@ -994,7 +992,8 @@ def test_fsrs_tools_work_through_json_rpc(
     assert rescheduled["result"]["backup"]["path"]
 
     spanish_deck = next(
-        deck for deck in call("anki_decks_list", {"offset": 0, "limit": 20})["items"]
+        deck
+        for deck in call("anki_decks_list", {"offset": 0, "limit": 20})["items"]
         if deck["name"] == "Languages::Spanish"
     )
     stale_preview = call(
@@ -1002,9 +1001,7 @@ def test_fsrs_tools_work_through_json_rpc(
     )
 
     def sync_changes_fsrs_state(adapter: CollectionAdapter) -> None:
-        adapter.update_deck_limits(
-            spanish_deck["id"], "this_deck", {"desired_retention": 0.88}, ()
-        )
+        adapter.update_deck_limits(spanish_deck["id"], "this_deck", {"desired_retention": 0.88}, ())
 
     service = client.app.app.state.collection_service
     service.executor.submit(lambda adapter: setattr(adapter, "sync_on_write", True)).result()
@@ -1030,9 +1027,7 @@ def test_fsrs_tools_work_through_json_rpc(
         assert recorded is not None
         operation, request_hash, receipt = recorded
         receipt["remote_synced"] = False
-        adapter._state.put_receipt(
-            "optimize-default-preset", operation, request_hash, receipt
-        )
+        adapter._state.put_receipt("optimize-default-preset", operation, request_hash, receipt)
         adapter._state.mark_pending_discarded_by_full_download()
 
     service.executor.submit(discard_pending_optimization).result()
@@ -1896,9 +1891,7 @@ def test_tool_errors_are_machine_readable(
         CollectionAdapter,
         "preview_fsrs_reschedule",
         lambda self, config_id, desired_retention, parameters: (_ for _ in ()).throw(
-            ResourceLimitError(
-                "FSRS reschedule: maximum=1, observed_at_least=2; split scope"
-            )
+            ResourceLimitError("FSRS reschedule: maximum=1, observed_at_least=2; split scope")
         ),
     )
     limited = error_for(
@@ -1949,3 +1942,80 @@ def test_tool_errors_are_machine_readable(
     assert internal["code"] == "INTERNAL_ERROR"
     assert internal["message"] == "internal collection operation failed"
     assert "collection.anki2" not in json.dumps(internal)
+
+
+def test_initial_media_sync_starts_on_startup_and_guards_media_tools(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import time
+
+    sync_calls: list[bool] = []
+    monkeypatch.setattr(
+        Collection,
+        "sync_login",
+        lambda self, username, password, endpoint: SyncAuth(hkey="key", endpoint=endpoint),
+    )
+
+    def sync_collection(self: Collection, auth: SyncAuth, sync_media: bool) -> SyncOutput:
+        sync_calls.append(sync_media)
+        return SyncOutput(required=0)
+
+    monkeypatch.setattr(Collection, "sync_collection", sync_collection)
+    monkeypatch.setattr(
+        "anki._backend.RustBackend.media_sync_status",
+        lambda self: MediaSyncStatusResponse(active=True),
+    )
+    headers = {
+        "Authorization": "Bearer correct-token",
+        "Accept": "application/json, text/event-stream",
+    }
+    with TestClient(create_app(settings)) as custom_client:
+        initialized = custom_client.post(
+            "/mcp",
+            headers=headers,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "clientInfo": {"name": "pytest", "version": "1"},
+                },
+            },
+        )
+        headers["Mcp-Session-Id"] = initialized.headers["mcp-session-id"]
+
+        def call(request_id: int, name: str, arguments: dict[str, object]) -> dict[str, Any]:
+            return custom_client.post(
+                "/mcp",
+                headers=headers,
+                json={
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                },
+            ).json()["result"]
+
+        assert call(2, "anki_sync_login", {}).get("isError") is not True
+        # No tool starts it: the startup driver notices the login and begins the media sync.
+        deadline = time.monotonic() + 10
+        while not sync_calls:
+            assert time.monotonic() < deadline, "initial media sync never started"
+            time.sleep(0.05)
+        status = json.loads(call(3, "anki_status", {})["content"][0]["text"])
+        guarded = call(4, "anki_media_list", {})
+        decks = call(5, "anki_decks_list", {})
+        readiness = custom_client.get("/health/ready")
+
+    text = guarded["content"][0]["text"]
+    payload = json.loads(text[text.index("{") :])
+    assert sync_calls == [True]
+    assert status["ready"] is False
+    assert status["readiness_reason"] == "initial_media_sync_in_progress"
+    assert guarded["isError"] is True
+    assert payload["code"] == "MEDIA_SYNC_IN_PROGRESS"
+    assert payload["details"]["media_sync"]["state"] == "in_progress"
+    assert decks.get("isError") is not True
+    assert readiness.status_code == 200

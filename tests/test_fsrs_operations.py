@@ -358,9 +358,7 @@ async def test_fsrs_operations_bound_the_selected_search_not_the_collection(
 
     monkeypatch.setattr(RustBackendGenerated, "compute_fsrs_params", compute_fsrs_params)
 
-    async with AnkiCollectionService(
-        path, max_page_size=100, max_search_scan=2
-    ) as service:
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=2) as service:
         optimized_result = await service.optimize_fsrs(
             1, search="deck:FSRS -is:new", health_check=True
         )
@@ -385,9 +383,7 @@ async def test_fsrs_selected_search_stops_after_limit_plus_one(
         return original(self, query, order=order, reverse=reverse)
 
     monkeypatch.setattr(Collection, "find_cards", bounded_find_cards)
-    async with AnkiCollectionService(
-        path, max_page_size=100, max_search_scan=1
-    ) as service:
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=1) as service:
         with pytest.raises(ResourceLimitError, match="observed_at_least=2"):
             await service.preview_fsrs_optimization(1, search="deck:FSRS", health_check=True)
 
@@ -452,9 +448,7 @@ async def test_fsrs_reschedule_fingerprint_tracks_per_deck_retention_override(
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
         before = await service.preview_fsrs_reschedule(1, 0.91, None)
 
-        await service.update_deck_limits(
-            deck_id, "this_deck", {"desired_retention": 0.88}, ()
-        )
+        await service.update_deck_limits(deck_id, "this_deck", {"desired_retention": 0.88}, ())
         after = await service.preview_fsrs_reschedule(1, 0.91, None)
 
     assert after["state_fingerprint"] != before["state_fingerprint"]
@@ -469,9 +463,7 @@ async def test_fsrs_reschedule_honors_per_deck_retention_override(
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
         card_id = (await service.search_cards("deck:FSRS -is:new", 0, 1))["items"][0]["id"]
         before = await service.get_card(card_id)
-        await service.update_deck_limits(
-            deck_id, "this_deck", {"desired_retention": 0.88}, ()
-        )
+        await service.update_deck_limits(deck_id, "this_deck", {"desired_retention": 0.88}, ())
         preview = await service.preview_fsrs_reschedule(1, 0.91, None)
         result = await service.reschedule_fsrs(1, 0.91, None)
         after = await service.get_card(card_id)
@@ -497,20 +489,17 @@ async def test_fsrs_reschedule_fingerprint_tracks_ordered_review_history(
             db = adapter.collection.db
             assert db is not None
             rows = db.all(
-                "select id, ease, ivl, lastIvl, factor, time, type "
-                "from revlog order by id limit 2"
+                "select id, ease, ivl, lastIvl, factor, time, type from revlog order by id limit 2"
             )
             assert len(rows) == 2
             first, second = rows
             db.execute(
-                "update revlog set ease=?, ivl=?, lastIvl=?, factor=?, time=?, type=? "
-                "where id=?",
+                "update revlog set ease=?, ivl=?, lastIvl=?, factor=?, time=?, type=? where id=?",
                 *second[1:],
                 first[0],
             )
             db.execute(
-                "update revlog set ease=?, ivl=?, lastIvl=?, factor=?, time=?, type=? "
-                "where id=?",
+                "update revlog set ease=?, ivl=?, lastIvl=?, factor=?, time=?, type=? where id=?",
                 *first[1:],
                 second[0],
             )
@@ -537,10 +526,7 @@ async def test_fsrs_reschedule_fingerprint_ignores_history_before_configured_dat
         def change_ignored_review(adapter):  # type: ignore[no-untyped-def]
             db = adapter.collection.db
             assert db is not None
-            db.execute(
-                "update revlog set time = time + 1 "
-                "where id = (select min(id) from revlog)"
-            )
+            db.execute("update revlog set time = time + 1 where id = (select min(id) from revlog)")
 
         await service.executor.run(change_ignored_review)
         after = await service.preview_fsrs_reschedule(1, 0.91, None)
@@ -689,9 +675,7 @@ async def test_fsrs_reschedule_candidate_discovery_accepts_exact_limit_across_de
     path, deck_id = fsrs_collection
     _add_review_state_card(path, deck_id, "Second eligible card", with_revlog=True)
 
-    async with AnkiCollectionService(
-        path, max_page_size=100, max_search_scan=2
-    ) as service:
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=2) as service:
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
         preview = await service.preview_fsrs_reschedule(1, 0.91, None)
 
@@ -707,9 +691,7 @@ async def test_fsrs_reschedule_candidate_discovery_rejects_one_over_limit_before
     _add_review_state_card(path, deck_id, "Ineligible review-state card 1")
     _add_review_state_card(path, deck_id, "Ineligible review-state card 2")
 
-    async with AnkiCollectionService(
-        path, max_page_size=100, max_search_scan=2
-    ) as service:
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=2) as service:
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
         with pytest.raises(
             ValueError,
@@ -724,9 +706,7 @@ async def test_fsrs_reschedule_rejects_preset_deck_scope_over_limit(
 ) -> None:
     path, _ = fsrs_collection
 
-    async with AnkiCollectionService(
-        path, max_page_size=100, max_search_scan=1
-    ) as service:
+    async with AnkiCollectionService(path, max_page_size=100, max_search_scan=1) as service:
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
         with pytest.raises(
             ValueError,
@@ -878,9 +858,7 @@ async def test_backup_before_returns_new_nonempty_backup_receipt(
     path, _ = fsrs_collection
     native_create_backup = Collection.create_backup
 
-    def create_backup(
-        self, *, backup_folder: str, force: bool, wait_for_completion: bool
-    ) -> bool:  # type: ignore[no-untyped-def]
+    def create_backup(self, *, backup_folder: str, force: bool, wait_for_completion: bool) -> bool:  # type: ignore[no-untyped-def]
         assert force is True
         assert wait_for_completion is True
         return native_create_backup(
@@ -909,9 +887,7 @@ async def test_backup_failure_keeps_idempotent_mutation_retryable(
     attempts = 0
     native_create_backup = Collection.create_backup
 
-    def create_backup(
-        self, *, backup_folder: str, force: bool, wait_for_completion: bool
-    ) -> bool:  # type: ignore[no-untyped-def]
+    def create_backup(self, *, backup_folder: str, force: bool, wait_for_completion: bool) -> bool:  # type: ignore[no-untyped-def]
         nonlocal attempts
         attempts += 1
         if attempts == 1:
@@ -973,9 +949,7 @@ async def test_fsrs_reschedule_rejects_malformed_ignore_date(
     path, _ = fsrs_collection
     async with AnkiCollectionService(path, max_page_size=100) as service:
         await service.update_deck_scheduler_settings(None, None, fsrs_enabled=True)
-        await service.update_deck_preset(
-            1, None, {"ignore_revlogs_before_date": "not-a-date"}
-        )
+        await service.update_deck_preset(1, None, {"ignore_revlogs_before_date": "not-a-date"})
         with pytest.raises(ValueError, match="YYYY-MM-DD"):
             await service.preview_fsrs_reschedule(1, 0.91, None)
 

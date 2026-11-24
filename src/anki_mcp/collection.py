@@ -59,6 +59,8 @@ SYNC_REQUIRED_NAMES = (
 )
 MEDIA_SYNC_POLL_SECONDS = 0.1
 MEDIA_SYNC_ABORT_GRACE_SECONDS = 1.0
+INITIAL_MEDIA_SYNC_RETRY_SECONDS = 5.0
+INITIAL_MEDIA_SYNC_MAX_RETRY_SECONDS = 300.0
 DECK_PRESET_SECTIONS: dict[str, tuple[str, ...]] = {
     "learning": (
         "learn_steps",
@@ -145,6 +147,14 @@ class MediaSyncFailedError(TimeoutError):
     """Raised when requested media synchronization does not complete safely."""
 
 
+class MediaSyncInProgressError(RuntimeError):
+    """Raised by media tools while the initial media sync has not completed."""
+
+    def __init__(self, media_sync: dict[str, Any]) -> None:
+        super().__init__("the initial media sync has not completed; media is incomplete")
+        self.media_sync = media_sync
+
+
 class BackupFailedError(RuntimeError):
     """Raised when a guarded mutation cannot obtain a verified current backup."""
 
@@ -165,6 +175,7 @@ class CollectionAdapter:
         sync_on_read: bool = False,
         sync_on_write: bool = False,
         media_sync_wait_seconds: float = 10,
+        initial_media_sync: bool = False,
     ) -> None:
         if anki.lang.current_i18n is None:
             anki.lang.set_lang("en_US")
@@ -179,6 +190,9 @@ class CollectionAdapter:
         self.sync_on_read = sync_on_read
         self.sync_on_write = sync_on_write
         self.media_sync_wait_seconds = media_sync_wait_seconds
+        self.initial_media_sync = initial_media_sync
+        self._initial_media_sync_failures = 0
+        self._initial_media_sync_retry_at = 0.0
         # Anki runs media sync on its own backend thread. These fields track the run that this
         # process started so that completion and failure are recorded even when no caller waits.
         self._media_sync_running = False
@@ -263,20 +277,25 @@ class CollectionAdapter:
             else None
         )
         authenticated = self._sync_auth is not None
-        ready = collection_ready and authenticated and pending_name is None
         if not collection_ready:
             reason = "collection_unavailable"
         elif pending_name is not None:
             reason = "full_sync_required"
         elif not authenticated:
             reason = "authentication_required"
+        elif self._initial_media_sync_pending():
+            reason = (
+                "initial_media_sync_failed"
+                if self._media_sync_state == "failed"
+                else "initial_media_sync_in_progress"
+            )
         else:
             reason = None
         return {
             "anki_version": version("anki"),
             "collection_ready": collection_ready,
             "authenticated": authenticated,
-            "ready": ready,
+            "ready": reason is None,
             "readiness_reason": reason,
             "pending_full_sync": pending_name,
             "last_sync_at": self._last_sync_at,
@@ -417,7 +436,9 @@ class CollectionAdapter:
                     "bootstrap requires sync credentials or persisted authentication"
                 )
             self.sync_login(username, password, endpoint)
-        sync_result = self.sync(sync_media=False)
+        # With media requested, a full download passes the server media usn through and the
+        # backend starts the initial media sync as soon as the download finishes.
+        sync_result = self.sync(sync_media=self.initial_media_sync, media_wait_seconds=0)
         required = sync_result["required"]
         if required in {"FULL_SYNC", "FULL_DOWNLOAD"}:
             result = self.full_sync(upload=False)
@@ -525,7 +546,7 @@ class CollectionAdapter:
         self._state.put_receipt(idempotency_key, operation, request_hash, intent)
         try:
             result = mutate(self)
-        except (ValueError, LookupError, BackupFailedError):
+        except (ValueError, LookupError, BackupFailedError, MediaSyncInProgressError):
             self._state.delete_receipt(idempotency_key)
             raise
         receipt: dict[str, Any] = {
@@ -986,9 +1007,7 @@ class CollectionAdapter:
     def _bounded_preset_decks(self, config_id: int, operation: str) -> list[dict[str, Any]]:
         db = self.collection.db
         assert db is not None
-        rows = db.all(
-            "select id, name from decks order by id limit ?", self.max_search_scan + 1
-        )
+        rows = db.all("select id, name from decks order by id limit ?", self.max_search_scan + 1)
         if len(rows) > self.max_search_scan:
             raise ResourceLimitError(
                 f"FSRS {operation} for preset {config_id}: maximum={self.max_search_scan}, "
@@ -1155,9 +1174,7 @@ class CollectionAdapter:
         request = SimulateFsrsReviewRequest(
             params=self._active_fsrs_parameters(config, defaults),
             desired_retention=(
-                float(config.desired_retention)
-                if desired_retention is None
-                else desired_retention
+                float(config.desired_retention) if desired_retention is None else desired_retention
             ),
             deck_size=deck_size,
             days_to_simulate=days_to_simulate,
@@ -1235,9 +1252,7 @@ class CollectionAdapter:
         knowledge = [float(value) for value in response.accumulated_knowledge_acquisition]
         lengths = {len(daily_reviews), len(daily_new), len(daily_time), len(knowledge)}
         if lengths != {days_to_simulate}:
-            raise RuntimeError(
-                "Anki 26.5 FSRS simulator returned incompatible daily array lengths"
-            )
+            raise RuntimeError("Anki 26.5 FSRS simulator returned incompatible daily array lengths")
         result["summary"] = {
             "total_reviews": sum(daily_reviews),
             "total_new_cards": sum(daily_new),
@@ -1375,9 +1390,7 @@ class CollectionAdapter:
                 ):
                     valid_card_ids.add(int(row[0]))
                 review_history_hash.update(
-                    json.dumps(
-                        list(row), ensure_ascii=False, separators=(",", ":")
-                    ).encode("utf-8")
+                    json.dumps(list(row), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 )
                 review_history_hash.update(b"\n")
             last_review_id = int(review_rows[-1][1])
@@ -1467,9 +1480,7 @@ class CollectionAdapter:
         desired_retention: float | None,
         parameters: Sequence[float] | None,
     ) -> dict[str, Any]:
-        _, _, impact = self._fsrs_reschedule_impact(
-            config_id, desired_retention, parameters
-        )
+        _, _, impact = self._fsrs_reschedule_impact(config_id, desired_retention, parameters)
         return impact
 
     def reschedule_fsrs(
@@ -1509,6 +1520,7 @@ class CollectionAdapter:
         deck = self.collection.decks.get(cast("DeckId", deck_id), default=False)
         if deck is None:  # pragma: no cover - validated by _deck_config_state
             raise LookupError(f"deck {deck_id} not found")
+
         def resolved_layers(source_deck_id: int, source_state: Any) -> tuple[Any, Any, Any]:
             entry = next(
                 item
@@ -1566,9 +1578,7 @@ class CollectionAdapter:
         parent_chain = []
         for parent in parents:
             parent_id = int(parent["id"])
-            _, _, parent_effective = resolved_layers(
-                parent_id, self._deck_config_state(parent_id)
-            )
+            _, _, parent_effective = resolved_layers(parent_id, self._deck_config_state(parent_id))
             parent_chain.append(
                 {
                     "deck_id": parent_id,
@@ -2236,9 +2246,7 @@ class CollectionAdapter:
             "note_type_id": note_type_id,
             "affected_notes": note_count,
             "backup_required": True,
-            "full_sync_required": self._forces_full_sync(
-                operation, note_type_id, source_ordinals
-            ),
+            "full_sync_required": self._forces_full_sync(operation, note_type_id, source_ordinals),
             "state_fingerprint": self._impact_fingerprint(
                 {"models": models, "current_model": current_model}
             ),
@@ -2258,6 +2266,7 @@ class CollectionAdapter:
         return source_ordinals != list(range(len(current)))
 
     def _media_path(self, filename: str, *, require_exists: bool) -> Path:
+        self._require_initial_media_sync()
         if (
             "\x00" in filename
             or not filename.strip()
@@ -2273,6 +2282,7 @@ class CollectionAdapter:
         return path
 
     def list_media(self, offset: int, limit: int) -> dict[str, Any]:
+        self._require_initial_media_sync()
         items = []
         for path in Path(self.collection.media.dir()).iterdir():
             if path.is_file() and not path.is_symlink():
@@ -2383,6 +2393,7 @@ class CollectionAdapter:
         }
 
     def check_media(self, offset: int, limit: int) -> dict[str, Any]:
+        self._require_initial_media_sync()
         self._page([], offset, limit)
         response = self.collection.media.check()
         missing = sorted((str(name) for name in response.missing), key=str.casefold)
@@ -2418,9 +2429,7 @@ class CollectionAdapter:
         card = self.collection.get_card(cast("CardId", card_id))
         return {"id": int(card.id), "note_id": int(card.nid), "deck_id": int(card.did)}
 
-    def get_card(
-        self, card_id: int, include_sections: Sequence[str] = ()
-    ) -> dict[str, Any]:
+    def get_card(self, card_id: int, include_sections: Sequence[str] = ()) -> dict[str, Any]:
         requested = set(include_sections)
         unknown = requested - {"review_summary", "fsrs"}
         if unknown:
@@ -2502,9 +2511,7 @@ class CollectionAdapter:
                     else None
                 ),
                 "retrievability": (
-                    float(stats.fsrs_retrievability)
-                    if stats.HasField("memory_state")
-                    else None
+                    float(stats.fsrs_retrievability) if stats.HasField("memory_state") else None
                 ),
                 "desired_retention": (
                     float(stats.desired_retention) if stats.HasField("memory_state") else None
@@ -2604,9 +2611,7 @@ class CollectionAdapter:
             result["review_kind"] = kinds[kind] if 0 <= kind < len(kinds) else "unknown"
         if "rating_label" in include_fields:
             result["rating_label"] = (
-                ("", "Again", "Hard", "Good", "Easy")[rating]
-                if 1 <= rating <= 4
-                else None
+                ("", "Again", "Hard", "Good", "Easy")[rating] if 1 <= rating <= 4 else None
             )
         if "intervals" in include_fields:
             result["interval_seconds"] = int(entry.interval)
@@ -2699,29 +2704,21 @@ class CollectionAdapter:
                 }
             )
 
-        period = {0: "all_time", 30: "one_month", 90: "three_months", 365: "one_year"}[
-            days
-        ]
+        period = {0: "all_time", 30: "one_month", 90: "three_months", 365: "one_year"}[days]
         button_period = graphs["buttons"][period]
         rating_counts = [
             sum(int(values[index]) for values in button_period.values()) for index in range(4)
         ]
         retained = sum(
-            int(value)
-            for category in ("young", "mature")
-            for value in button_period[category][1:]
+            int(value) for category in ("young", "mature") for value in button_period[category][1:]
         )
-        forgotten = sum(
-            int(button_period[category][0]) for category in ("young", "mature")
-        )
+        forgotten = sum(int(button_period[category][0]) for category in ("young", "mature"))
         retention_total = retained + forgotten
         total_seconds = total_millis / 1_000
         return {
             "reviews": total_reviews,
             "answer_seconds": total_seconds,
-            "average_answer_seconds": (
-                total_seconds / total_reviews if total_reviews else None
-            ),
+            "average_answer_seconds": (total_seconds / total_reviews if total_reviews else None),
             "retention": retained / retention_total if retention_total else None,
             "ratings": dict(zip(("again", "hard", "good", "easy"), rating_counts, strict=True)),
             "daily": daily,
@@ -2781,9 +2778,7 @@ class CollectionAdapter:
             "summary": self._review_summary(graph_data, days),
         }
         if requested_sections:
-            result["sections"] = {
-                section: graph_data[section] for section in requested_sections
-            }
+            result["sections"] = {section: graph_data[section] for section in requested_sections}
         return result
 
     def _basic_model(self) -> dict[str, Any]:
@@ -3007,6 +3002,57 @@ class CollectionAdapter:
         )
         return {"authenticated": True, "endpoint_kind": "custom" if endpoint else "ankiweb"}
 
+    def _initial_media_sync_pending(self) -> bool:
+        # Without sync authentication there is no remote media to wait for.
+        return (
+            self.initial_media_sync
+            and self._last_media_sync_at is None
+            and self._sync_auth is not None
+        )
+
+    def _require_initial_media_sync(self) -> None:
+        if self._initial_media_sync_pending():
+            raise MediaSyncInProgressError(self._media_sync_snapshot())
+
+    def _schedule_initial_media_sync_retry(self) -> None:
+        self._initial_media_sync_failures += 1
+        delay = min(
+            INITIAL_MEDIA_SYNC_RETRY_SECONDS * 2 ** (self._initial_media_sync_failures - 1),
+            INITIAL_MEDIA_SYNC_MAX_RETRY_SECONDS,
+        )
+        self._initial_media_sync_retry_at = time.monotonic() + delay
+        MEDIA_SYNC_LOGGER.info(
+            "initial media sync retry in %.0fs failures=%d",
+            delay,
+            self._initial_media_sync_failures,
+        )
+
+    def advance_initial_media_sync(self) -> bool:
+        """Start, poll or retry the initial media sync; return whether it is still pending.
+
+        Anki's media sync resumes from the files already transferred, so each retry (and each
+        process restart, since completion is persisted as last_media_sync_at) continues the work.
+        """
+        if not self.initial_media_sync or self._last_media_sync_at is not None:
+            return False
+        if self._media_sync_running:
+            self._poll_media_sync()
+            if self._media_sync_state == "failed":
+                self._schedule_initial_media_sync_retry()
+        elif (
+            self._sync_auth is not None
+            and self._pending_full_sync is None
+            and self.check_ready()
+            and time.monotonic() >= self._initial_media_sync_retry_at
+        ):
+            try:
+                self.sync(sync_media=True, media_wait_seconds=0)
+            except Exception as exc:
+                if self._media_sync_state != "failed":
+                    self._fail_media_sync(self._media_sync_error_code(exc), type(exc).__name__)
+                self._schedule_initial_media_sync_retry()
+        return self._last_media_sync_at is None
+
     def _media_sync_snapshot(self) -> dict[str, Any]:
         """Describe the media sync this process last started, without touching the backend."""
         progress = self._media_sync_progress or {}
@@ -3174,7 +3220,7 @@ class CollectionAdapter:
             )
         return self._media_sync_snapshot()
 
-    def _settle_media_sync(self, started: bool) -> dict[str, Any]:
+    def _settle_media_sync(self, started: bool, wait_seconds: float) -> dict[str, Any]:
         """Wait briefly for a just-started media sync, then report whatever state it is in.
 
         The wait is bounded by media_sync_wait_seconds so the single collection thread (and the
@@ -3191,9 +3237,9 @@ class CollectionAdapter:
             }
         self._track_media_sync("sync")
         wait_started = time.monotonic()
-        deadline = wait_started + self.media_sync_wait_seconds
+        deadline = wait_started + wait_seconds
         polls = 0
-        MEDIA_SYNC_LOGGER.debug("media sync wait begin budget=%.1fs", self.media_sync_wait_seconds)
+        MEDIA_SYNC_LOGGER.debug("media sync wait begin budget=%.1fs", wait_seconds)
         while True:
             polls += 1
             snapshot = self._poll_media_sync(raise_on_failure=True)
@@ -3207,7 +3253,7 @@ class CollectionAdapter:
                 return snapshot
             time.sleep(min(MEDIA_SYNC_POLL_SECONDS, max(deadline - time.monotonic(), 0)))
 
-    def sync(self, sync_media: bool) -> dict[str, Any]:
+    def sync(self, sync_media: bool, media_wait_seconds: float | None = None) -> dict[str, Any]:
         if self._sync_auth is None:
             raise SyncLoginRequiredError("sync login is required before synchronization")
         try:
@@ -3240,7 +3286,14 @@ class CollectionAdapter:
                 full_download = self.full_sync(upload=False)
                 required = "NO_CHANGES"
             media_sync = (
-                self._settle_media_sync(started=output.required not in {2, 3, 4})
+                self._settle_media_sync(
+                    started=output.required not in {2, 3, 4},
+                    wait_seconds=(
+                        self.media_sync_wait_seconds
+                        if media_wait_seconds is None
+                        else media_wait_seconds
+                    ),
+                )
                 if sync_media
                 else None
             )
@@ -3346,6 +3399,7 @@ class CollectionExecutor:
         sync_on_read: bool = False,
         sync_on_write: bool = False,
         media_sync_wait_seconds: float = 10,
+        initial_media_sync: bool = False,
     ) -> None:
         self._path = path
         self._max_page_size = max_page_size
@@ -3358,6 +3412,7 @@ class CollectionExecutor:
         self._sync_on_read = sync_on_read
         self._sync_on_write = sync_on_write
         self._media_sync_wait_seconds = media_sync_wait_seconds
+        self._initial_media_sync = initial_media_sync
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="anki-collection")
         self._adapter: CollectionAdapter | None = None
         self._worker_id: int | None = None
@@ -3382,6 +3437,7 @@ class CollectionExecutor:
                 self._sync_on_read,
                 self._sync_on_write,
                 self._media_sync_wait_seconds,
+                self._initial_media_sync,
             )
 
         self._pool.submit(open_collection).result()
@@ -3422,6 +3478,7 @@ class AnkiCollectionService:
         sync_on_read: bool = False,
         sync_on_write: bool = False,
         media_sync_wait_seconds: float = 10,
+        initial_media_sync: bool = False,
     ) -> None:
         self.executor = CollectionExecutor(
             path,
@@ -3435,6 +3492,7 @@ class AnkiCollectionService:
             sync_on_read,
             sync_on_write,
             media_sync_wait_seconds,
+            initial_media_sync,
         )
 
     async def __aenter__(self) -> AnkiCollectionService:
@@ -3696,7 +3754,6 @@ class AnkiCollectionService:
             lambda adapter: adapter.update_templates(note_type_id, mappings)
         )
 
-
     async def list_media(self, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.list_media(offset, limit))
 
@@ -3722,12 +3779,8 @@ class AnkiCollectionService:
     async def search_cards(self, query: str, offset: int, limit: int) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.search_cards(query, offset, limit))
 
-    async def get_card(
-        self, card_id: int, include_sections: Sequence[str] = ()
-    ) -> dict[str, Any]:
-        return await self.executor.run(
-            lambda adapter: adapter.get_card(card_id, include_sections)
-        )
+    async def get_card(self, card_id: int, include_sections: Sequence[str] = ()) -> dict[str, Any]:
+        return await self.executor.run(lambda adapter: adapter.get_card(card_id, include_sections))
 
     async def list_reviews(
         self,
@@ -3869,6 +3922,9 @@ class AnkiCollectionService:
 
     async def full_sync(self, upload: bool) -> dict[str, Any]:
         return await self.executor.run(lambda adapter: adapter.full_sync(upload))
+
+    async def advance_initial_media_sync(self) -> bool:
+        return await self.executor.run(lambda adapter: adapter.advance_initial_media_sync())
 
     async def check_ready(self) -> bool:
         return await self.executor.run(lambda adapter: adapter.check_ready())

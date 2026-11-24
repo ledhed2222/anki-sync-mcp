@@ -259,6 +259,42 @@ def test_large_media_sync_runs_in_background_and_status_stays_responsive(
     assert again["media_sync"]["state"] == "completed"
 
 
+def test_initial_media_sync_completes_after_bootstrap_against_official_server(
+    official_sync_server: str, tmp_path: Path
+) -> None:
+    """A bootstrapped empty client fetches all remote media with no media tool call."""
+    file_count = 1500
+    _seed_server_with_media(
+        official_sync_server, str(tmp_path / "seed" / "collection.anki2"), file_count
+    )
+    client_path = str(tmp_path / "client" / "collection.anki2")
+    Path(client_path).parent.mkdir()
+    Collection(client_path).close()
+
+    async def bootstrap_and_drive() -> tuple[set[str | None], dict[str, Any]]:
+        async with AnkiCollectionService(
+            client_path, max_page_size=100, initial_media_sync=True
+        ) as service:
+            await service.bootstrap(
+                "download_if_empty", "phase1-user", "phase1-password", official_sync_server
+            )
+            reasons: set[str | None] = set()
+            deadline = time.monotonic() + 120
+            while await service.advance_initial_media_sync():
+                reasons.add((await service.status())["readiness_reason"])
+                assert time.monotonic() < deadline, "initial media sync did not finish"
+                await asyncio.sleep(0.05)
+            return reasons, await service.status()
+
+    reasons, status = asyncio.run(bootstrap_and_drive())
+
+    assert "initial_media_sync_in_progress" in reasons
+    assert status["ready"] is True
+    assert status["last_media_sync_at"]
+    downloaded = {path.name for path in (Path(client_path).parent / "collection.media").iterdir()}
+    assert {f"seed-{index:05d}.txt" for index in range(file_count)} <= downloaded
+
+
 def test_structural_change_from_another_device_downloads_only_when_nothing_is_unsynced(
     official_sync_server: str, tmp_path: Path
 ) -> None:
